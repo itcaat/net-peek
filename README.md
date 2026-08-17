@@ -77,7 +77,15 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow builds Linux release artifacts with GoReleaser. Because `net-peek` uses `libpcap`, release builds require CGO and currently publish Linux `amd64` binaries.
+The release workflow builds native artifacts for Linux and macOS on both `amd64` and `arm64`. Because `net-peek` uses `libpcap`, release builds use native GitHub Actions runners instead of CGO cross-compilation.
+
+Release assets:
+
+- `net-peek_<tag>_linux_amd64.tar.gz`
+- `net-peek_<tag>_linux_arm64.tar.gz`
+- `net-peek_<tag>_darwin_amd64.tar.gz`
+- `net-peek_<tag>_darwin_arm64.tar.gz`
+- `checksums.txt`
 
 The same release flow is available through `make`:
 

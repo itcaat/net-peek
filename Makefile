@@ -12,7 +12,12 @@ build:
 	go build -o net-peek .
 
 snapshot:
-	goreleaser build --snapshot --clean
+	@rm -rf dist/package
+	@mkdir -p dist/package
+	go build -trimpath -o dist/package/net-peek .
+	@cp README.md dist/package/
+	@if compgen -G "LICENSE*" > /dev/null; then cp LICENSE* dist/package/; fi
+	@tar -czf "dist/net-peek_snapshot_$$(go env GOOS)_$$(go env GOARCH).tar.gz" -C dist/package .
 
 next-tag:
 	@$(MAKE) --no-print-directory _next_tag

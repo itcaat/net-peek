@@ -8,7 +8,25 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: linux_amd64
+            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+          - runner: ubuntu-24.04-arm
+            asset: linux_arm64
+            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+          - runner: macos-15-intel
+            asset: darwin_amd64
+            install: "true"
+          - runner: macos-15
+            asset: darwin_arm64
+            install: "true"
 
     steps:
       - name: Checkout
@@ -19,18 +37,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install libpcap
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpcap-dev
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+      - name: Install native dependencies
+        run: ${{ matrix.install }}
 
       - name: Install dependencies
         run: go mod download
@@ -38,36 +46,5 @@ jobs:
       - name: Run tests
         run: go test -v -race ./...
 
-  build:
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Install libpcap
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpcap-dev
-
-      - name: Test GoReleaser build
-        uses: goreleaser/goreleaser-action@v5
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: build --snapshot --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-artifacts
-          path: dist/
-          retention-days: 7
+      - name: Build binary
+        run: go build -trimpath -o net-peek .
