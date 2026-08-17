@@ -126,6 +126,7 @@ Keys:
 
 - `enter`: open the selected IP and show its connections
 - `backspace`, `esc`, `left`: return from an IP connection view to the IP list
+- `tab`: open or close interface selector
 - `/`: search or filter IPs
 - `enter`: open the selected IP while searching
 - `esc`: clear search input while searching

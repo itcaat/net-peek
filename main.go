@@ -272,6 +272,9 @@ type model struct {
 	paused      bool
 	searching   bool
 	searchQuery string
+	ifacePicker bool
+	ifaceList   []string
+	ifaceIndex  int
 	errs        []string
 	width       int
 	height      int
@@ -280,6 +283,17 @@ type model struct {
 
 func newModel(capture *captureManager, iface string) model {
 	initial := model{sortField: sortTotal, sortDesc: true}
+	ifaces, err := availableInterfaceNames()
+	if err != nil || len(ifaces) == 0 {
+		ifaces = []string{"all"}
+	}
+	ifaceIndex := 0
+	for i, name := range ifaces {
+		if name == iface {
+			ifaceIndex = i
+			break
+		}
+	}
 	columns := initial.ipColumns(28)
 	t := table.New(
 		table.WithColumns(columns),
@@ -299,6 +313,8 @@ func newModel(capture *captureManager, iface string) model {
 		table:       t,
 		sortField:   initial.sortField,
 		sortDesc:    initial.sortDesc,
+		ifaceList:   ifaces,
+		ifaceIndex:  ifaceIndex,
 		lastTick:    time.Now(),
 	}
 }
@@ -318,6 +334,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			m.capture.stop()
 			return m, tea.Quit
+		}
+		if m.ifacePicker {
+			return m.handleIfacePickerKey(msg)
 		}
 		if m.searching && m.handleSearchKey(msg) {
 			return m, nil
@@ -342,6 +361,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case " ":
 			m.paused = !m.paused
+		case "tab":
+			m.openIfacePicker()
 		case "/":
 			if !m.inIPView() {
 				m.searching = true
@@ -389,6 +410,76 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.table, cmd = m.table.Update(msg)
 	return m, cmd
+}
+
+func (m model) handleIfacePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		m.capture.stop()
+		return m, tea.Quit
+	case "tab", "esc":
+		m.ifacePicker = false
+	case "up", "k":
+		if len(m.ifaceList) > 0 {
+			m.ifaceIndex = (m.ifaceIndex - 1 + len(m.ifaceList)) % len(m.ifaceList)
+		}
+	case "down", "j":
+		if len(m.ifaceList) > 0 {
+			m.ifaceIndex = (m.ifaceIndex + 1) % len(m.ifaceList)
+		}
+	case "enter":
+		m.selectIface()
+	}
+	return m, nil
+}
+
+func (m *model) openIfacePicker() {
+	ifaces, err := availableInterfaceNames()
+	if err == nil && len(ifaces) > 0 {
+		m.ifaceList = ifaces
+	}
+	if len(m.ifaceList) == 0 {
+		m.ifaceList = []string{"all"}
+	}
+	m.ifaceIndex = 0
+	for i, name := range m.ifaceList {
+		if name == m.iface {
+			m.ifaceIndex = i
+			break
+		}
+	}
+	m.ifacePicker = true
+}
+
+func (m *model) selectIface() {
+	if len(m.ifaceList) == 0 || m.ifaceIndex < 0 || m.ifaceIndex >= len(m.ifaceList) {
+		return
+	}
+	nextIface := m.ifaceList[m.ifaceIndex]
+	if nextIface == m.iface {
+		m.ifacePicker = false
+		return
+	}
+	nextCapture, err := newCaptureManager(context.Background(), nextIface)
+	if err != nil {
+		m.errs = append(m.errs, err.Error())
+		if len(m.errs) > 4 {
+			m.errs = m.errs[len(m.errs)-4:]
+		}
+		return
+	}
+	m.capture.stop()
+	m.capture = nextCapture
+	m.iface = nextIface
+	m.ifacePicker = false
+	m.selectedIP = ""
+	m.searching = false
+	m.searchQuery = ""
+	m.stats = map[string]*ipStats{}
+	m.connections = map[string][]connection{}
+	m.lastTick = time.Now()
+	m.table.SetRows(nil)
+	m.resizeColumns()
 }
 
 func (m *model) handleSearchKey(msg tea.KeyMsg) bool {
@@ -680,6 +771,7 @@ func (m model) View() string {
 	}
 	keys := strings.Join([]string{
 		hotkey(keyStyle, "enter", "open"),
+		hotkey(keyStyle, "tab", "iface"),
 		hotkey(keyStyle, "/", "search"),
 		hotkey(keyStyle, "space", "pause"),
 		hotkey(keyStyle, "q", "quit"),
@@ -689,6 +781,7 @@ func (m model) View() string {
 			hotkey(keyStyle, "enter", "open"),
 			hotkey(keyStyle, "esc", "clear"),
 			hotkey(keyStyle, "backspace", "delete"),
+			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
 			hotkey(keyStyle, "ctrl+c", "quit"),
 		}, "  ")
@@ -703,9 +796,26 @@ func (m model) View() string {
 		keys = strings.Join([]string{
 			hotkey(keyStyle, "backspace", "back"),
 			hotkey(keyStyle, "esc", "back"),
+			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
 			hotkey(keyStyle, "q", "quit"),
 		}, "  ")
+	}
+	if m.ifacePicker {
+		primary = strings.Join([]string{
+			titleStyle.Render("net-peek"),
+			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
+			mutedStyle.Render("select interface"),
+		}, "  ")
+		keys = strings.Join([]string{
+			hotkey(keyStyle, "up/down", "select"),
+			hotkey(keyStyle, "enter", "switch"),
+			hotkey(keyStyle, "esc", "close"),
+			hotkey(keyStyle, "tab", "close"),
+			hotkey(keyStyle, "q", "quit"),
+		}, "  ")
+		header := primary + "\n" + keys
+		return boxStyle.Render(header + "\n\n" + m.renderIfacePicker(mutedStyle, valueStyle))
 	}
 	header := primary + "\n" + keys
 	body := m.table.View()
@@ -730,6 +840,32 @@ func (m model) View() string {
 	}
 
 	return boxStyle.Render(header + "\n\n" + body + "\n\n" + status)
+}
+
+func (m model) renderIfacePicker(mutedStyle, valueStyle lipgloss.Style) string {
+	lines := make([]string, 0, len(m.ifaceList)+1)
+	limit := min(len(m.ifaceList), max(8, m.height-6))
+	start := 0
+	if m.ifaceIndex >= limit {
+		start = m.ifaceIndex - limit + 1
+	}
+	for i := start; i < len(m.ifaceList) && i < start+limit; i++ {
+		prefix := "  "
+		nameStyle := mutedStyle
+		if i == m.ifaceIndex {
+			prefix = "> "
+			nameStyle = valueStyle
+		}
+		current := ""
+		if m.ifaceList[i] == m.iface {
+			current = mutedStyle.Render(" current")
+		}
+		lines = append(lines, prefix+nameStyle.Render(m.ifaceList[i])+current)
+	}
+	if len(m.ifaceList) > limit {
+		lines = append(lines, mutedStyle.Render("..."))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func hotkey(style lipgloss.Style, key, label string) string {
@@ -1035,16 +1171,27 @@ func truncate(s string, n int) string {
 }
 
 func availableInterfaces() (string, error) {
-	devices, err := pcap.FindAllDevs()
+	names, err := availableInterfaceNames()
 	if err != nil {
 		return "", err
 	}
-	names := make([]string, 0, len(devices))
+	return strings.Join(names, ", "), nil
+}
+
+func availableInterfaceNames() ([]string, error) {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(devices)+1)
+	names = append(names, "all")
 	for _, dev := range devices {
 		names = append(names, dev.Name)
 	}
-	sort.Strings(names)
-	return strings.Join(names, ", "), nil
+	if len(names) > 1 {
+		sort.Strings(names[1:])
+	}
+	return names, nil
 }
 
 func main() {
