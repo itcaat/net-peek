@@ -23,6 +23,24 @@ sudo setcap cap_net_raw,cap_net_admin=eip ./net-peek
 
 ## Install
 
+Using the latest GitHub release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itcaat/net-peek/main/install.sh | sh
+```
+
+Install into a custom directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itcaat/net-peek/main/install.sh | BIN_DIR="$HOME/.local/bin" sh
+```
+
+Install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itcaat/net-peek/main/install.sh | VERSION="v0.1.0" sh
+```
+
 On a remote server:
 
 ```sh
