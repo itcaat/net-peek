@@ -7,7 +7,7 @@ It shows:
 - inbound and outbound rate per IP;
 - total inbound and outbound bytes since start;
 - established connection count per remote IP;
-- connection details when `d` is pressed.
+- connection details when an IP is opened with `enter`.
 
 ## Requirements
 
@@ -143,4 +143,4 @@ Keys:
 
 ## Notes
 
-Traffic is counted from captured packets after the program starts. Connection counts are collected from `ss` on Linux and `netstat` elsewhere, then grouped by remote IP.
+Traffic is counted from captured packets after the program starts. Connection counts are collected from `/proc/net/tcp*` on Linux, `lsof` on macOS, and `netstat` as a fallback, then grouped by remote IP.
