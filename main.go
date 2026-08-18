@@ -973,7 +973,7 @@ func (m model) View() string {
 	if m.inIPView() {
 		stat := m.stats[m.selectedIP]
 		if stat != nil {
-			status = mutedStyle.Render("connections: " + strconv.Itoa(len(m.connections[m.selectedIP])) + " | in: " + humanBytes(float64(stat.InBytes)) + " | out: " + humanBytes(float64(stat.OutBytes)) + " | rate: " + humanBytes(stat.TotalRate()) + "/s")
+			status = mutedStyle.Render("connections: " + strconv.Itoa(len(m.connections[m.selectedIP])) + " | in: " + humanBytes(float64(stat.InBytes)) + " | out: " + humanBytes(float64(stat.OutBytes)) + " | rate: " + humanBitRate(stat.TotalRate()))
 		} else {
 			status = mutedStyle.Render("no traffic stats for selected IP yet")
 		}

@@ -124,3 +124,15 @@ func TestGatewaySkipsLocalNodeIP(t *testing.T) {
 		t.Fatalf("unexpected event: %#v", events[0])
 	}
 }
+
+func TestRateFormattingUsesBits(t *testing.T) {
+	if got := humanMbitRate(125000); got != "1.00Mbit/s" {
+		t.Fatalf("humanMbitRate(125000) = %q, want 1.00Mbit/s", got)
+	}
+	if got := humanBitRate(125000); got != "1.0Mbit/s" {
+		t.Fatalf("humanBitRate(125000) = %q, want 1.0Mbit/s", got)
+	}
+	if got := humanBitRate(1024); got != "8.2Kbit/s" {
+		t.Fatalf("humanBitRate(1024) = %q, want 8.2Kbit/s", got)
+	}
+}
