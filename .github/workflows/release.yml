@@ -98,6 +98,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          args=()
+          if [[ "${GITHUB_REF_NAME}" == *"-beta."* ]]; then
+            args+=(--prerelease)
+          fi
           gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt \
             --title "net-peek ${GITHUB_REF_NAME}" \
-            --generate-notes
+            --generate-notes \
+            "${args[@]}"

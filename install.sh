@@ -4,6 +4,7 @@ set -eu
 REPO="${REPO:-itcaat/net-peek}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 VERSION="${VERSION:-latest}"
+CHANNEL="${CHANNEL:-}"
 
 need() {
 	if ! command -v "$1" >/dev/null 2>&1; then
@@ -35,11 +36,25 @@ arm64 | aarch64) arch="arm64" ;;
 	;;
 esac
 
-if [ "$VERSION" = "latest" ]; then
+if [ -z "$CHANNEL" ] && [ "$VERSION" = "beta" ]; then
+	CHANNEL="beta"
+fi
+if [ -z "$CHANNEL" ]; then
+	CHANNEL="stable"
+fi
+
+if [ "$VERSION" = "latest" ] && [ "$CHANNEL" = "stable" ]; then
 	api_url="https://api.github.com/repos/$REPO/releases/latest"
 	tag="$(curl -fsSL "$api_url" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 	if [ -z "$tag" ]; then
 		echo "failed to resolve latest release tag for $REPO" >&2
+		exit 1
+	fi
+elif [ "$CHANNEL" = "beta" ]; then
+	api_url="https://api.github.com/repos/$REPO/releases?per_page=100"
+	tag="$(curl -fsSL "$api_url" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-beta\.[0-9][^"]*\)".*/\1/p' | head -n 1)"
+	if [ -z "$tag" ]; then
+		echo "failed to resolve latest beta release tag for $REPO" >&2
 		exit 1
 	fi
 else

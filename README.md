@@ -41,6 +41,12 @@ Install a specific version:
 curl -fsSL https://raw.githubusercontent.com/itcaat/net-peek/main/install.sh | VERSION="v0.1.0" sh
 ```
 
+Install the latest beta release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itcaat/net-peek/main/install.sh | VERSION="beta" sh
+```
+
 On a remote server:
 
 ```sh
@@ -114,6 +120,15 @@ make next-tag
 make release
 ```
 
+Beta releases use prerelease tags:
+
+```sh
+make next-beta
+make beta
+```
+
+`make beta` creates tags like `v0.1.0-beta.1` and GitHub publishes them as prereleases.
+
 ## Usage
 
 ```sh
@@ -121,6 +136,14 @@ go run . -list
 sudo go run . -i all
 sudo go run . -i eth0
 ```
+
+Gateway/NAT mode groups forwarded traffic by the client IP on the LAN-side interface:
+
+```sh
+sudo go run . --mode gateway --lan-iface zt0 --wan-iface eth0
+```
+
+In gateway mode, packets are captured on the LAN interface to avoid double-counting the same forwarded packet on both LAN and WAN interfaces. Connection counts still describe local host sockets; NAT conntrack support is not implemented yet.
 
 Keys:
 
