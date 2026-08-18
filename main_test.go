@@ -94,7 +94,7 @@ func TestGroupConnectionsFromProc(t *testing.T) {
 }
 
 func TestGatewayIPPairToEvent(t *testing.T) {
-	manager := &captureManager{mode: modeGateway}
+	manager := &captureManager{mode: modeGateway, localIPs: map[string]struct{}{}}
 
 	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
 	if len(events) != 2 {
@@ -107,5 +107,20 @@ func TestGatewayIPPairToEvent(t *testing.T) {
 	in := events[1]
 	if in.remoteIP != "8.8.8.8" || in.dir != dirIn || in.bytes != 120 {
 		t.Fatalf("unexpected inbound event: %#v", in)
+	}
+}
+
+func TestGatewaySkipsLocalNodeIP(t *testing.T) {
+	manager := &captureManager{
+		mode:     modeGateway,
+		localIPs: map[string]struct{}{"10.147.17.1": {}},
+	}
+
+	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.1"), net.ParseIP("10.147.17.23"), 100)
+	if len(events) != 1 {
+		t.Fatalf("expected only remote client event, got %#v", events)
+	}
+	if events[0].remoteIP != "10.147.17.23" || events[0].dir != dirIn {
+		t.Fatalf("unexpected event: %#v", events[0])
 	}
 }

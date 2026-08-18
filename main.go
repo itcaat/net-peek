@@ -89,6 +89,7 @@ type captureManager struct {
 	errs      chan error
 	cancel    context.CancelFunc
 	localNets []*net.IPNet
+	localIPs  map[string]struct{}
 	mode      captureMode
 }
 
@@ -115,6 +116,7 @@ func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMo
 		errs:      make(chan error, max(1, len(selected)*2)),
 		cancel:    cancel,
 		localNets: collectLocalNets(selected),
+		localIPs:  collectLocalIPs(selected),
 		mode:      mode,
 	}
 
@@ -225,7 +227,11 @@ func (m *captureManager) gatewayIPPairToEvents(src, dst net.IP, bytes uint64) []
 }
 
 func (m *captureManager) gatewayIPAllowed(ip net.IP) bool {
-	return true
+	if ip == nil {
+		return false
+	}
+	_, local := m.localIPs[ip.String()]
+	return !local
 }
 
 func collectLocalNets(devices []pcap.Interface) []*net.IPNet {
@@ -248,6 +254,19 @@ func collectLocalNets(devices []pcap.Interface) []*net.IPNet {
 		}
 	}
 	return nets
+}
+
+func collectLocalIPs(devices []pcap.Interface) map[string]struct{} {
+	ips := map[string]struct{}{}
+	for _, dev := range devices {
+		for _, addr := range dev.Addresses {
+			if addr.IP == nil || addr.IP.IsUnspecified() {
+				continue
+			}
+			ips[addr.IP.String()] = struct{}{}
+		}
+	}
+	return ips
 }
 
 func containsIP(nets []*net.IPNet, ip net.IP) bool {
@@ -654,8 +673,8 @@ func (m *model) refreshRows() {
 		rows = append(rows, table.Row{
 			stat.IP,
 			strconv.Itoa(len(stat.Connections)),
-			humanBytes(stat.InRate) + "/s",
-			humanBytes(stat.OutRate) + "/s",
+			humanBitRate(stat.InRate),
+			humanBitRate(stat.OutRate),
 			humanBytes(float64(stat.InBytes)),
 			humanBytes(float64(stat.OutBytes)),
 			humanBytes(float64(stat.Total())),
@@ -783,6 +802,25 @@ func (m model) sortColumnTitle(field sortField, title string) string {
 	return title + " ^"
 }
 
+func (m model) totalRates() (float64, float64) {
+	if m.inIPView() {
+		stat := m.stats[m.selectedIP]
+		if stat == nil {
+			return 0, 0
+		}
+		return stat.InRate, stat.OutRate
+	}
+	var inRate, outRate float64
+	for _, stat := range m.stats {
+		if m.searchQuery != "" && !strings.Contains(stat.IP, m.searchQuery) {
+			continue
+		}
+		inRate += stat.InRate
+		outRate += stat.OutRate
+	}
+	return inRate, outRate
+}
+
 func (m model) View() string {
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
@@ -799,11 +837,13 @@ func (m model) View() string {
 	if m.paused {
 		state = "paused"
 	}
+	totalInRate, totalOutRate := m.totalRates()
 	primary := strings.Join([]string{
 		titleStyle.Render("net-peek"),
 		mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 		mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 		mutedStyle.Render("state") + " " + valueStyle.Render(state),
+		mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 		mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 	}, "  ")
 	if m.mode == modeGateway {
@@ -812,6 +852,7 @@ func (m model) View() string {
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
+			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 			mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 		}
 		primary = strings.Join(parts, "  ")
@@ -846,6 +887,7 @@ func (m model) View() string {
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
+			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 			mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 		}, "  ")
 		if m.mode == modeGateway {
@@ -854,6 +896,7 @@ func (m model) View() string {
 				mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 				mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 				mutedStyle.Render("state") + " " + valueStyle.Render(state),
+				mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 				mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 			}
 			primary = strings.Join(parts, "  ")
@@ -1227,6 +1270,22 @@ func humanBytes(v float64) string {
 		}
 	}
 	return fmt.Sprintf("%.0f%s", v, units[0])
+}
+
+func humanMbitRate(bytesPerSecond float64) string {
+	return fmt.Sprintf("%.2fMbit/s", bytesPerSecond*8/1000/1000)
+}
+
+func humanBitRate(bytesPerSecond float64) string {
+	bits := bytesPerSecond * 8
+	units := []string{"bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"}
+	for i := 0; i < len(units)-1 && bits >= 1000; i++ {
+		bits /= 1000
+		if bits < 1000 {
+			return fmt.Sprintf("%.1f%s", bits, units[i+1])
+		}
+	}
+	return fmt.Sprintf("%.0f%s", bits, units[0])
 }
 
 func truncate(s string, n int) string {
