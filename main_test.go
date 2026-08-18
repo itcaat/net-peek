@@ -94,34 +94,18 @@ func TestGroupConnectionsFromProc(t *testing.T) {
 }
 
 func TestGatewayIPPairToEvent(t *testing.T) {
-	_, lan, err := net.ParseCIDR("10.147.17.0/24")
-	if err != nil {
-		t.Fatal(err)
-	}
-	manager := &captureManager{
-		mode:     modeGateway,
-		lanIface: "zt0",
-		lanNets:  []*net.IPNet{lan},
-	}
+	manager := &captureManager{mode: modeGateway}
 
-	out, ok := manager.gatewayIPPairToEvent("zt0", net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
-	if !ok {
-		t.Fatal("expected outbound gateway packet")
+	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
+	if len(events) != 2 {
+		t.Fatalf("expected two gateway events, got %#v", events)
 	}
+	out := events[0]
 	if out.remoteIP != "10.147.17.23" || out.dir != dirOut || out.bytes != 120 {
 		t.Fatalf("unexpected outbound event: %#v", out)
 	}
-
-	in, ok := manager.gatewayIPPairToEvent("zt0", net.ParseIP("8.8.8.8"), net.ParseIP("10.147.17.23"), 80)
-	if !ok {
-		t.Fatal("expected inbound gateway packet")
-	}
-	if in.remoteIP != "10.147.17.23" || in.dir != dirIn || in.bytes != 80 {
+	in := events[1]
+	if in.remoteIP != "8.8.8.8" || in.dir != dirIn || in.bytes != 120 {
 		t.Fatalf("unexpected inbound event: %#v", in)
-	}
-
-	_, ok = manager.gatewayIPPairToEvent("eth0", net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
-	if ok {
-		t.Fatal("expected non-LAN interface packet to be ignored")
 	}
 }

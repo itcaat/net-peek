@@ -137,13 +137,19 @@ sudo go run . -i all
 sudo go run . -i eth0
 ```
 
-Gateway/NAT mode groups forwarded traffic by the client IP on the LAN-side interface:
+Gateway/NAT mode counts all captured traffic by source and destination IP:
 
 ```sh
-sudo go run . --mode gateway --lan-iface zt0 --wan-iface eth0
+sudo go run . --mode gateway
 ```
 
-In gateway mode, packets are captured on the LAN interface to avoid double-counting the same forwarded packet on both LAN and WAN interfaces. Connection counts still describe local host sockets; NAT conntrack support is not implemented yet.
+In gateway mode, every captured packet is counted twice: source IP gets `Out`, destination IP gets `In`. By default this captures `all` interfaces. Use `-i` only when you want to restrict it to one interface:
+
+```sh
+sudo go run . --mode gateway -i zt0
+```
+
+Connection counts still describe local host sockets; NAT conntrack support is not implemented yet.
 
 Keys:
 

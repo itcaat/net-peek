@@ -90,16 +90,13 @@ type captureManager struct {
 	cancel    context.CancelFunc
 	localNets []*net.IPNet
 	mode      captureMode
-	lanIface  string
-	wanIface  string
-	lanNets   []*net.IPNet
 }
 
 func newCaptureManager(ctx context.Context, iface string) (*captureManager, error) {
-	return newCaptureManagerWithMode(ctx, iface, modeHost, "", "")
+	return newCaptureManagerWithMode(ctx, iface, modeHost)
 }
 
-func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMode, lanIface, wanIface string) (*captureManager, error) {
+func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMode) (*captureManager, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
@@ -112,29 +109,13 @@ func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMo
 		cancel()
 		return nil, err
 	}
-	lanDevices := selected
-	if mode == modeGateway {
-		if lanIface == "" || wanIface == "" {
-			cancel()
-			return nil, fmt.Errorf("gateway mode requires both lan and wan interfaces")
-		}
-		selected, err = selectCaptureDevices(devices, lanIface)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		lanDevices = selected
-	}
 
 	manager := &captureManager{
 		events:    make(chan packetEvent, 8192),
-		errs:      make(chan error, len(selected)),
+		errs:      make(chan error, max(1, len(selected)*2)),
 		cancel:    cancel,
 		localNets: collectLocalNets(selected),
 		mode:      mode,
-		lanIface:  lanIface,
-		wanIface:  wanIface,
-		lanNets:   collectLocalNets(lanDevices),
 	}
 
 	for _, dev := range selected {
@@ -189,7 +170,7 @@ func (m *captureManager) captureInterface(ctx context.Context, name string) {
 			if !ok {
 				return
 			}
-			if ev, ok := m.packetToEvent(name, packet); ok {
+			for _, ev := range m.packetToEvents(packet) {
 				select {
 				case m.events <- ev:
 				default:
@@ -199,22 +180,22 @@ func (m *captureManager) captureInterface(ctx context.Context, name string) {
 	}
 }
 
-func (m *captureManager) packetToEvent(iface string, packet gopacket.Packet) (packetEvent, bool) {
+func (m *captureManager) packetToEvents(packet gopacket.Packet) []packetEvent {
 	length := uint64(len(packet.Data()))
 	if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 		ipv4 := ipv4Layer.(*layers.IPv4)
-		return m.ipPairToEvent(iface, ipv4.SrcIP, ipv4.DstIP, length)
+		return m.ipPairToEvents(ipv4.SrcIP, ipv4.DstIP, length)
 	}
 	if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
 		ipv6 := ipv6Layer.(*layers.IPv6)
-		return m.ipPairToEvent(iface, ipv6.SrcIP, ipv6.DstIP, length)
+		return m.ipPairToEvents(ipv6.SrcIP, ipv6.DstIP, length)
 	}
-	return packetEvent{}, false
+	return nil
 }
 
-func (m *captureManager) ipPairToEvent(iface string, src, dst net.IP, bytes uint64) (packetEvent, bool) {
+func (m *captureManager) ipPairToEvents(src, dst net.IP, bytes uint64) []packetEvent {
 	if m.mode == modeGateway {
-		return m.gatewayIPPairToEvent(iface, src, dst, bytes)
+		return m.gatewayIPPairToEvents(src, dst, bytes)
 	}
 
 	srcLocal := containsIP(m.localNets, src)
@@ -222,30 +203,29 @@ func (m *captureManager) ipPairToEvent(iface string, src, dst net.IP, bytes uint
 
 	switch {
 	case srcLocal && !dstLocal:
-		return packetEvent{remoteIP: dst.String(), dir: dirOut, bytes: bytes}, true
+		return []packetEvent{{remoteIP: dst.String(), dir: dirOut, bytes: bytes}}
 	case dstLocal && !srcLocal:
-		return packetEvent{remoteIP: src.String(), dir: dirIn, bytes: bytes}, true
+		return []packetEvent{{remoteIP: src.String(), dir: dirIn, bytes: bytes}}
 	case srcLocal && dstLocal:
-		return packetEvent{remoteIP: dst.String(), dir: dirOut, bytes: bytes}, true
+		return []packetEvent{{remoteIP: dst.String(), dir: dirOut, bytes: bytes}}
 	default:
-		return packetEvent{}, false
+		return nil
 	}
 }
 
-func (m *captureManager) gatewayIPPairToEvent(iface string, src, dst net.IP, bytes uint64) (packetEvent, bool) {
-	if iface != m.lanIface {
-		return packetEvent{}, false
+func (m *captureManager) gatewayIPPairToEvents(src, dst net.IP, bytes uint64) []packetEvent {
+	events := make([]packetEvent, 0, 2)
+	if !isLocalish(src.String()) && m.gatewayIPAllowed(src) {
+		events = append(events, packetEvent{remoteIP: src.String(), dir: dirOut, bytes: bytes})
 	}
-	srcLAN := containsIP(m.lanNets, src)
-	dstLAN := containsIP(m.lanNets, dst)
-	switch {
-	case srcLAN && !dstLAN:
-		return packetEvent{remoteIP: src.String(), dir: dirOut, bytes: bytes}, true
-	case dstLAN && !srcLAN:
-		return packetEvent{remoteIP: dst.String(), dir: dirIn, bytes: bytes}, true
-	default:
-		return packetEvent{}, false
+	if !isLocalish(dst.String()) && m.gatewayIPAllowed(dst) {
+		events = append(events, packetEvent{remoteIP: dst.String(), dir: dirIn, bytes: bytes})
 	}
+	return events
+}
+
+func (m *captureManager) gatewayIPAllowed(ip net.IP) bool {
+	return true
 }
 
 func collectLocalNets(devices []pcap.Interface) []*net.IPNet {
@@ -324,8 +304,6 @@ type model struct {
 	capture     *captureManager
 	iface       string
 	mode        captureMode
-	lanIface    string
-	wanIface    string
 	stats       map[string]*ipStats
 	connections map[string][]connection
 	table       table.Model
@@ -344,7 +322,7 @@ type model struct {
 	lastTick    time.Time
 }
 
-func newModel(capture *captureManager, iface string, mode captureMode, lanIface, wanIface string) model {
+func newModel(capture *captureManager, iface string, mode captureMode) model {
 	initial := model{sortField: sortTotal, sortDesc: true}
 	ifaces, err := availableInterfaceNames()
 	if err != nil || len(ifaces) == 0 {
@@ -372,8 +350,6 @@ func newModel(capture *captureManager, iface string, mode captureMode, lanIface,
 		capture:     capture,
 		iface:       iface,
 		mode:        mode,
-		lanIface:    lanIface,
-		wanIface:    wanIface,
 		stats:       map[string]*ipStats{},
 		connections: map[string][]connection{},
 		table:       t,
@@ -504,9 +480,6 @@ func (m *model) openIfacePicker() {
 	if err == nil && len(ifaces) > 0 {
 		m.ifaceList = ifaces
 	}
-	if m.mode == modeGateway {
-		m.ifaceList = withoutAllInterface(m.ifaceList)
-	}
 	if len(m.ifaceList) == 0 {
 		m.ifaceList = []string{"all"}
 	}
@@ -525,20 +498,12 @@ func (m *model) selectIface() {
 		return
 	}
 	nextIface := m.ifaceList[m.ifaceIndex]
-	if nextIface == m.iface || (m.mode == modeGateway && nextIface == "all") {
+	if nextIface == m.iface {
 		m.ifacePicker = false
 		return
 	}
 	nextMode := m.mode
-	nextLAN := m.lanIface
-	nextWAN := m.wanIface
-	if nextMode == modeGateway {
-		nextLAN = nextIface
-	} else {
-		nextLAN = ""
-		nextWAN = ""
-	}
-	nextCapture, err := newCaptureManagerWithMode(context.Background(), nextIface, nextMode, nextLAN, nextWAN)
+	nextCapture, err := newCaptureManagerWithMode(context.Background(), nextIface, nextMode)
 	if err != nil {
 		m.errs = append(m.errs, err.Error())
 		if len(m.errs) > 4 {
@@ -549,8 +514,6 @@ func (m *model) selectIface() {
 	m.capture.stop()
 	m.capture = nextCapture
 	m.iface = nextIface
-	m.lanIface = nextLAN
-	m.wanIface = nextWAN
 	m.ifacePicker = false
 	m.selectedIP = ""
 	m.searching = false
@@ -844,14 +807,14 @@ func (m model) View() string {
 		mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 	}, "  ")
 	if m.mode == modeGateway {
-		primary = strings.Join([]string{
+		parts := []string{
 			titleStyle.Render("net-peek"),
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
-			mutedStyle.Render("lan") + " " + valueStyle.Render(m.lanIface),
-			mutedStyle.Render("wan") + " " + valueStyle.Render(m.wanIface),
+			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
 			mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
-		}, "  ")
+		}
+		primary = strings.Join(parts, "  ")
 	}
 	if m.searchQuery != "" || m.searching {
 		cursor := ""
@@ -886,14 +849,14 @@ func (m model) View() string {
 			mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 		}, "  ")
 		if m.mode == modeGateway {
-			primary = strings.Join([]string{
+			parts := []string{
 				titleStyle.Render("net-peek"),
 				mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
-				mutedStyle.Render("lan") + " " + valueStyle.Render(m.lanIface),
-				mutedStyle.Render("wan") + " " + valueStyle.Render(m.wanIface),
+				mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 				mutedStyle.Render("state") + " " + valueStyle.Render(state),
-				mutedStyle.Render("client") + " " + valueStyle.Render(m.selectedIP),
-			}, "  ")
+				mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
+			}
+			primary = strings.Join(parts, "  ")
 		}
 		keys = strings.Join([]string{
 			hotkey(keyStyle, "backspace", "back"),
@@ -924,6 +887,9 @@ func (m model) View() string {
 	body := m.table.View()
 
 	status := mutedStyle.Render("capturing packets; totals are since start")
+	if m.mode == modeGateway {
+		status = mutedStyle.Render("gateway mode counts every captured packet by source IP as Out and destination IP as In")
+	}
 	if m.inIPView() {
 		stat := m.stats[m.selectedIP]
 		if stat != nil {
@@ -1297,21 +1263,9 @@ func availableInterfaceNames() ([]string, error) {
 	return names, nil
 }
 
-func withoutAllInterface(names []string) []string {
-	filtered := make([]string, 0, len(names))
-	for _, name := range names {
-		if name != "all" {
-			filtered = append(filtered, name)
-		}
-	}
-	return filtered
-}
-
 func main() {
 	iface := flag.String("i", "all", "network interface to capture, or all")
 	modeFlag := flag.String("mode", string(modeHost), "capture mode: host or gateway")
-	lanIface := flag.String("lan-iface", "", "LAN/client interface for gateway mode")
-	wanIface := flag.String("wan-iface", "", "WAN/upstream interface for gateway mode")
 	list := flag.Bool("list", false, "list capture interfaces")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -1335,24 +1289,19 @@ func main() {
 	switch mode {
 	case modeHost:
 	case modeGateway:
-		if *lanIface == "" || *wanIface == "" {
-			fmt.Fprintln(os.Stderr, "gateway mode requires --lan-iface and --wan-iface")
-			os.Exit(1)
-		}
-		*iface = *lanIface
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q; expected host or gateway\n", *modeFlag)
 		os.Exit(1)
 	}
 
-	capture, err := newCaptureManagerWithMode(context.Background(), *iface, mode, *lanIface, *wanIface)
+	capture, err := newCaptureManagerWithMode(context.Background(), *iface, mode)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer capture.stop()
 
-	p := tea.NewProgram(newModel(capture, *iface, mode, *lanIface, *wanIface), tea.WithAltScreen())
+	p := tea.NewProgram(newModel(capture, *iface, mode), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
