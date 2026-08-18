@@ -126,6 +126,28 @@ func TestGatewaySkipsLocalNodeIP(t *testing.T) {
 	}
 }
 
+func TestCaptureManagerCoalescesPacketEvents(t *testing.T) {
+	manager := &captureManager{pending: map[string]trafficCounters{}}
+
+	manager.addPacketEvents([]packetEvent{
+		{remoteIP: "10.0.0.2", dir: dirIn, bytes: 100},
+		{remoteIP: "10.0.0.2", dir: dirIn, bytes: 40},
+		{remoteIP: "10.0.0.2", dir: dirOut, bytes: 20},
+		{remoteIP: "8.8.8.8", dir: dirOut, bytes: 10},
+	})
+
+	deltas := manager.drainDeltas()
+	if got := deltas["10.0.0.2"]; got.InBytes != 140 || got.OutBytes != 20 {
+		t.Fatalf("unexpected 10.0.0.2 counters: %#v", got)
+	}
+	if got := deltas["8.8.8.8"]; got.InBytes != 0 || got.OutBytes != 10 {
+		t.Fatalf("unexpected 8.8.8.8 counters: %#v", got)
+	}
+	if deltas := manager.drainDeltas(); len(deltas) != 0 {
+		t.Fatalf("expected second drain to be empty, got %#v", deltas)
+	}
+}
+
 func TestRateFormattingUsesBits(t *testing.T) {
 	if got := humanMbitRate(125000); got != "1.00Mbit/s" {
 		t.Fatalf("humanMbitRate(125000) = %q, want 1.00Mbit/s", got)
@@ -154,5 +176,28 @@ func TestRollingRatesForWindow(t *testing.T) {
 	}
 	if outRate != 200 {
 		t.Fatalf("outRate = %v, want 200", outRate)
+	}
+}
+
+func TestTotalRatesAreIndependentFromSearchFilter(t *testing.T) {
+	now := time.Unix(100, 0)
+	m := model{
+		stats:       map[string]*ipStats{},
+		searchQuery: "10.0.0.2",
+	}
+
+	m.totalInBytes = 100
+	m.totalOutBytes = 300
+	m.updateRates(now.Add(-time.Second))
+	m.totalInBytes = 600
+	m.totalOutBytes = 900
+	m.updateRates(now)
+
+	inRate, outRate := m.totalRates()
+	if inRate != 500 {
+		t.Fatalf("inRate = %v, want 500", inRate)
+	}
+	if outRate != 600 {
+		t.Fatalf("outRate = %v, want 600", outRate)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -54,6 +55,11 @@ type packetEvent struct {
 	remoteIP string
 	dir      direction
 	bytes    uint64
+}
+
+type trafficCounters struct {
+	InBytes  uint64
+	OutBytes uint64
 }
 
 type captureMode string
@@ -96,9 +102,10 @@ type connection struct {
 }
 
 type captureManager struct {
-	events    chan packetEvent
 	errs      chan error
 	cancel    context.CancelFunc
+	mu        sync.Mutex
+	pending   map[string]trafficCounters
 	localNets []*net.IPNet
 	localIPs  map[string]struct{}
 	mode      captureMode
@@ -127,9 +134,9 @@ func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMo
 	}
 
 	manager := &captureManager{
-		events:    make(chan packetEvent, 8192),
 		errs:      make(chan error, max(1, len(selected)*2)),
 		cancel:    cancel,
+		pending:   map[string]trafficCounters{},
 		localNets: collectLocalNets(selected),
 		localIPs:  collectLocalIPs(localIPDevices),
 		mode:      mode,
@@ -196,14 +203,37 @@ func (m *captureManager) captureInterface(ctx context.Context, name string) {
 			if !ok {
 				return
 			}
-			for _, ev := range m.packetToEvents(packet) {
-				select {
-				case m.events <- ev:
-				default:
-				}
-			}
+			m.addPacketEvents(m.packetToEvents(packet))
 		}
 	}
+}
+
+func (m *captureManager) addPacketEvents(events []packetEvent) {
+	if len(events) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ev := range events {
+		counters := m.pending[ev.remoteIP]
+		if ev.dir == dirIn {
+			counters.InBytes += ev.bytes
+		} else {
+			counters.OutBytes += ev.bytes
+		}
+		m.pending[ev.remoteIP] = counters
+	}
+}
+
+func (m *captureManager) drainDeltas() map[string]trafficCounters {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pending) == 0 {
+		return nil
+	}
+	deltas := m.pending
+	m.pending = map[string]trafficCounters{}
+	return deltas
 }
 
 func (m *captureManager) packetToEvents(packet gopacket.Packet) []packetEvent {
@@ -344,26 +374,31 @@ func (f sortField) String() string {
 }
 
 type model struct {
-	capture     *captureManager
-	iface       string
-	mode        captureMode
-	stats       map[string]*ipStats
-	connections map[string][]connection
-	table       table.Model
-	selectedIP  string
-	sortField   sortField
-	sortDesc    bool
-	paused      bool
-	avgIdx      int
-	searching   bool
-	searchQuery string
-	ifacePicker bool
-	ifaceList   []string
-	ifaceIndex  int
-	errs        []string
-	width       int
-	height      int
-	lastTick    time.Time
+	capture       *captureManager
+	iface         string
+	mode          captureMode
+	stats         map[string]*ipStats
+	connections   map[string][]connection
+	table         table.Model
+	selectedIP    string
+	sortField     sortField
+	sortDesc      bool
+	paused        bool
+	avgIdx        int
+	searching     bool
+	searchQuery   string
+	ifacePicker   bool
+	ifaceList     []string
+	ifaceIndex    int
+	totalInBytes  uint64
+	totalOutBytes uint64
+	totalInRate   float64
+	totalOutRate  float64
+	totalHistory  []statSample
+	errs          []string
+	width         int
+	height        int
+	lastTick      time.Time
 }
 
 func newModel(capture *captureManager, iface string, mode captureMode) model {
@@ -568,6 +603,11 @@ func (m *model) selectIface() {
 	m.searchQuery = ""
 	m.stats = map[string]*ipStats{}
 	m.connections = map[string][]connection{}
+	m.totalInBytes = 0
+	m.totalOutBytes = 0
+	m.totalInRate = 0
+	m.totalOutRate = 0
+	m.totalHistory = nil
 	m.lastTick = time.Now()
 	m.table.SetRows(nil)
 	m.resizeColumns()
@@ -655,19 +695,20 @@ func (m model) avgWindow() time.Duration {
 }
 
 func (m *model) drainEvents() {
+	for ip, delta := range m.capture.drainDeltas() {
+		stat := m.stats[ip]
+		if stat == nil {
+			stat = &ipStats{IP: ip}
+			m.stats[ip] = stat
+		}
+		stat.InBytes += delta.InBytes
+		stat.OutBytes += delta.OutBytes
+		m.totalInBytes += delta.InBytes
+		m.totalOutBytes += delta.OutBytes
+	}
+
 	for {
 		select {
-		case ev := <-m.capture.events:
-			stat := m.stats[ev.remoteIP]
-			if stat == nil {
-				stat = &ipStats{IP: ev.remoteIP}
-				m.stats[ev.remoteIP] = stat
-			}
-			if ev.dir == dirIn {
-				stat.InBytes += ev.bytes
-			} else {
-				stat.OutBytes += ev.bytes
-			}
 		case err := <-m.capture.errs:
 			if err != nil {
 				m.errs = append(m.errs, err.Error())
@@ -679,6 +720,10 @@ func (m *model) drainEvents() {
 }
 
 func (m *model) updateRates(now time.Time) {
+	m.totalHistory = append(m.totalHistory, statSample{At: now, InBytes: m.totalInBytes, OutBytes: m.totalOutBytes})
+	m.totalHistory = trimStatHistory(m.totalHistory, now)
+	m.totalInRate, m.totalOutRate = ratesForHistory(m.totalHistory, now, m.avgWindow())
+
 	for _, stat := range m.stats {
 		stat.History = append(stat.History, statSample{At: now, InBytes: stat.InBytes, OutBytes: stat.OutBytes})
 		stat.trimHistory(now)
@@ -689,28 +734,37 @@ func (m *model) updateRates(now time.Time) {
 }
 
 func (s *ipStats) trimHistory(now time.Time) {
+	s.History = trimStatHistory(s.History, now)
+}
+
+func trimStatHistory(history []statSample, now time.Time) []statSample {
 	maxWindow := avgWindows[len(avgWindows)-1] + time.Second
 	keepFrom := 0
-	for keepFrom < len(s.History) && now.Sub(s.History[keepFrom].At) > maxWindow {
+	for keepFrom < len(history) && now.Sub(history[keepFrom].At) > maxWindow {
 		keepFrom++
 	}
 	if keepFrom > 0 {
-		s.History = append([]statSample(nil), s.History[keepFrom:]...)
+		return append([]statSample(nil), history[keepFrom:]...)
 	}
+	return history
 }
 
 func (s *ipStats) ratesForWindow(now time.Time, window time.Duration) (float64, float64) {
-	if len(s.History) < 2 {
+	return ratesForHistory(s.History, now, window)
+}
+
+func ratesForHistory(history []statSample, now time.Time, window time.Duration) (float64, float64) {
+	if len(history) < 2 {
 		return 0, 0
 	}
-	current := s.History[len(s.History)-1]
-	base := s.History[0]
-	for i := len(s.History) - 2; i >= 0; i-- {
-		if now.Sub(s.History[i].At) >= window {
-			base = s.History[i]
+	current := history[len(history)-1]
+	base := history[0]
+	for i := len(history) - 2; i >= 0; i-- {
+		if now.Sub(history[i].At) >= window {
+			base = history[i]
 			break
 		}
-		base = s.History[i]
+		base = history[i]
 	}
 	elapsed := current.At.Sub(base.At).Seconds()
 	if elapsed <= 0 {
@@ -888,15 +942,7 @@ func (m model) totalRates() (float64, float64) {
 		}
 		return stat.InRate, stat.OutRate
 	}
-	var inRate, outRate float64
-	for _, stat := range m.stats {
-		if m.searchQuery != "" && !strings.Contains(stat.IP, m.searchQuery) {
-			continue
-		}
-		inRate += stat.InRate
-		outRate += stat.OutRate
-	}
-	return inRate, outRate
+	return m.totalInRate, m.totalOutRate
 }
 
 func (m model) View() string {
@@ -1016,7 +1062,7 @@ func (m model) View() string {
 
 	status := mutedStyle.Render("capturing packets; totals are since start")
 	if m.mode == modeGateway {
-		status = mutedStyle.Render("gateway mode counts every captured packet by source IP as Out and destination IP as In")
+		status = mutedStyle.Render("gateway mode aggregates captured packets by endpoint IP; connections are local sockets only")
 	}
 	if m.inIPView() {
 		stat := m.stats[m.selectedIP]
