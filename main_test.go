@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestParseProcNetTCPLine(t *testing.T) {
 	line := `0: 0500000A:D431 64771A02:01BB 01 00000000:00000000 02:00000355 00000000 1000 0 12345 2 0000000000000000 20 4 30 10 -1`
@@ -87,5 +90,38 @@ func TestGroupConnectionsFromProc(t *testing.T) {
 	grouped := groupConnections(conns)
 	if len(grouped["2.26.119.100"]) != 1 {
 		t.Fatalf("expected connection grouped by remote IP, got %#v", grouped)
+	}
+}
+
+func TestGatewayIPPairToEvent(t *testing.T) {
+	_, lan, err := net.ParseCIDR("10.147.17.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &captureManager{
+		mode:     modeGateway,
+		lanIface: "zt0",
+		lanNets:  []*net.IPNet{lan},
+	}
+
+	out, ok := manager.gatewayIPPairToEvent("zt0", net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
+	if !ok {
+		t.Fatal("expected outbound gateway packet")
+	}
+	if out.remoteIP != "10.147.17.23" || out.dir != dirOut || out.bytes != 120 {
+		t.Fatalf("unexpected outbound event: %#v", out)
+	}
+
+	in, ok := manager.gatewayIPPairToEvent("zt0", net.ParseIP("8.8.8.8"), net.ParseIP("10.147.17.23"), 80)
+	if !ok {
+		t.Fatal("expected inbound gateway packet")
+	}
+	if in.remoteIP != "10.147.17.23" || in.dir != dirIn || in.bytes != 80 {
+		t.Fatalf("unexpected inbound event: %#v", in)
+	}
+
+	_, ok = manager.gatewayIPPairToEvent("eth0", net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
+	if ok {
+		t.Fatal("expected non-LAN interface packet to be ignored")
 	}
 }
