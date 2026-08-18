@@ -161,6 +161,8 @@ Keys:
 - `esc`: clear search input while searching
 - arrow keys: navigate rows while searching
 - `space`: pause or resume table updates
+- `+`: faster refresh interval
+- `-`: slower refresh interval
 - `i`: sort by IP
 - `c`: sort by connection count
 - `r`: sort by inbound rate

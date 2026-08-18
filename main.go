@@ -27,9 +27,15 @@ import (
 
 const (
 	defaultSnapLen = 65535
-	statInterval   = time.Second
 	connInterval   = 2 * time.Second
 )
+
+var refreshIntervals = []time.Duration{
+	time.Second,
+	3 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+}
 
 var (
 	version = "dev"
@@ -330,6 +336,7 @@ type model struct {
 	sortField   sortField
 	sortDesc    bool
 	paused      bool
+	refreshIdx  int
 	searching   bool
 	searchQuery string
 	ifacePicker bool
@@ -381,7 +388,7 @@ func newModel(capture *captureManager, iface string, mode captureMode) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), connCmd())
+	return tea.Batch(m.tickCmd(), connCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -422,6 +429,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case " ":
 			m.paused = !m.paused
+		case "+", "=":
+			m.fasterRefresh()
+		case "-", "_":
+			m.slowerRefresh()
 		case "tab":
 			m.openIfacePicker()
 		case "/":
@@ -449,7 +460,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateRates(time.Time(msg))
 			m.refreshRows()
 		}
-		return m, tickCmd()
+		return m, m.tickCmd()
 	case connMsg:
 		if !m.paused {
 			m.connections = msg
@@ -560,7 +571,7 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) bool {
 		return false
 	case "/":
 		return true
-	case " ":
+	case " ", "+", "=", "-", "_":
 		return false
 	default:
 		if len(msg.Runes) > 0 {
@@ -600,6 +611,25 @@ func (m *model) setSort(field sortField) {
 	}
 	m.resizeColumns()
 	m.refreshRows()
+}
+
+func (m *model) fasterRefresh() {
+	if m.refreshIdx > 0 {
+		m.refreshIdx--
+	}
+}
+
+func (m *model) slowerRefresh() {
+	if m.refreshIdx < len(refreshIntervals)-1 {
+		m.refreshIdx++
+	}
+}
+
+func (m model) refreshInterval() time.Duration {
+	if m.refreshIdx < 0 || m.refreshIdx >= len(refreshIntervals) {
+		return refreshIntervals[0]
+	}
+	return refreshIntervals[m.refreshIdx]
 }
 
 func (m *model) drainEvents() {
@@ -843,6 +873,7 @@ func (m model) View() string {
 		mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 		mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 		mutedStyle.Render("state") + " " + valueStyle.Render(state),
+		mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
 		mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 		mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 	}, "  ")
@@ -852,6 +883,7 @@ func (m model) View() string {
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
+			mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
 			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 			mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 		}
@@ -869,6 +901,7 @@ func (m model) View() string {
 		hotkey(keyStyle, "tab", "iface"),
 		hotkey(keyStyle, "/", "search"),
 		hotkey(keyStyle, "space", "pause"),
+		hotkey(keyStyle, "+/-", "refresh"),
 		hotkey(keyStyle, "q", "quit"),
 	}, "  ")
 	if m.searching {
@@ -878,6 +911,7 @@ func (m model) View() string {
 			hotkey(keyStyle, "backspace", "delete"),
 			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
+			hotkey(keyStyle, "+/-", "refresh"),
 			hotkey(keyStyle, "ctrl+c", "quit"),
 		}, "  ")
 	}
@@ -887,6 +921,7 @@ func (m model) View() string {
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
+			mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
 			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 			mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 		}, "  ")
@@ -896,6 +931,7 @@ func (m model) View() string {
 				mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 				mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 				mutedStyle.Render("state") + " " + valueStyle.Render(state),
+				mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
 				mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 				mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 			}
@@ -906,6 +942,7 @@ func (m model) View() string {
 			hotkey(keyStyle, "esc", "back"),
 			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
+			hotkey(keyStyle, "+/-", "refresh"),
 			hotkey(keyStyle, "q", "quit"),
 		}, "  ")
 	}
@@ -984,8 +1021,8 @@ func hotkey(style lipgloss.Style, key, label string) string {
 	return style.Render(key) + " " + label
 }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(statInterval, func(t time.Time) tea.Msg {
+func (m model) tickCmd() tea.Cmd {
+	return tea.Tick(m.refreshInterval(), func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
