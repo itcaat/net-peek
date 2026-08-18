@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 func TestParseProcNetTCPLine(t *testing.T) {
@@ -134,5 +135,24 @@ func TestRateFormattingUsesBits(t *testing.T) {
 	}
 	if got := humanBitRate(1024); got != "8.2Kbit/s" {
 		t.Fatalf("humanBitRate(1024) = %q, want 8.2Kbit/s", got)
+	}
+}
+
+func TestRollingRatesForWindow(t *testing.T) {
+	now := time.Unix(100, 0)
+	stats := &ipStats{
+		History: []statSample{
+			{At: now.Add(-5 * time.Second), InBytes: 0, OutBytes: 0},
+			{At: now.Add(-3 * time.Second), InBytes: 300, OutBytes: 600},
+			{At: now, InBytes: 900, OutBytes: 1200},
+		},
+	}
+
+	inRate, outRate := stats.ratesForWindow(now, 3*time.Second)
+	if inRate != 200 {
+		t.Fatalf("inRate = %v, want 200", inRate)
+	}
+	if outRate != 200 {
+		t.Fatalf("outRate = %v, want 200", outRate)
 	}
 }

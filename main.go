@@ -30,7 +30,7 @@ const (
 	connInterval   = 2 * time.Second
 )
 
-var refreshIntervals = []time.Duration{
+var avgWindows = []time.Duration{
 	time.Second,
 	3 * time.Second,
 	5 * time.Second,
@@ -64,14 +64,19 @@ const (
 )
 
 type ipStats struct {
-	IP           string
-	InBytes      uint64
-	OutBytes     uint64
-	LastInBytes  uint64
-	LastOutBytes uint64
-	InRate       float64
-	OutRate      float64
-	Connections  []connection
+	IP          string
+	InBytes     uint64
+	OutBytes    uint64
+	InRate      float64
+	OutRate     float64
+	Connections []connection
+	History     []statSample
+}
+
+type statSample struct {
+	At       time.Time
+	InBytes  uint64
+	OutBytes uint64
 }
 
 func (s ipStats) Total() uint64 {
@@ -349,7 +354,7 @@ type model struct {
 	sortField   sortField
 	sortDesc    bool
 	paused      bool
-	refreshIdx  int
+	avgIdx      int
 	searching   bool
 	searchQuery string
 	ifacePicker bool
@@ -443,9 +448,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			m.paused = !m.paused
 		case "+", "=":
-			m.fasterRefresh()
+			m.shorterAvgWindow()
 		case "-", "_":
-			m.slowerRefresh()
+			m.longerAvgWindow()
 		case "tab":
 			m.openIfacePicker()
 		case "/":
@@ -626,23 +631,27 @@ func (m *model) setSort(field sortField) {
 	m.refreshRows()
 }
 
-func (m *model) fasterRefresh() {
-	if m.refreshIdx > 0 {
-		m.refreshIdx--
+func (m *model) shorterAvgWindow() {
+	if m.avgIdx > 0 {
+		m.avgIdx--
+		m.updateRates(time.Now())
+		m.refreshRows()
 	}
 }
 
-func (m *model) slowerRefresh() {
-	if m.refreshIdx < len(refreshIntervals)-1 {
-		m.refreshIdx++
+func (m *model) longerAvgWindow() {
+	if m.avgIdx < len(avgWindows)-1 {
+		m.avgIdx++
+		m.updateRates(time.Now())
+		m.refreshRows()
 	}
 }
 
-func (m model) refreshInterval() time.Duration {
-	if m.refreshIdx < 0 || m.refreshIdx >= len(refreshIntervals) {
-		return refreshIntervals[0]
+func (m model) avgWindow() time.Duration {
+	if m.avgIdx < 0 || m.avgIdx >= len(avgWindows) {
+		return avgWindows[0]
 	}
-	return refreshIntervals[m.refreshIdx]
+	return avgWindows[m.avgIdx]
 }
 
 func (m *model) drainEvents() {
@@ -670,18 +679,44 @@ func (m *model) drainEvents() {
 }
 
 func (m *model) updateRates(now time.Time) {
-	elapsed := now.Sub(m.lastTick).Seconds()
-	if elapsed <= 0 {
-		elapsed = 1
-	}
 	for _, stat := range m.stats {
-		stat.InRate = float64(stat.InBytes-stat.LastInBytes) / elapsed
-		stat.OutRate = float64(stat.OutBytes-stat.LastOutBytes) / elapsed
-		stat.LastInBytes = stat.InBytes
-		stat.LastOutBytes = stat.OutBytes
+		stat.History = append(stat.History, statSample{At: now, InBytes: stat.InBytes, OutBytes: stat.OutBytes})
+		stat.trimHistory(now)
+		stat.InRate, stat.OutRate = stat.ratesForWindow(now, m.avgWindow())
 		stat.Connections = m.connections[stat.IP]
 	}
 	m.lastTick = now
+}
+
+func (s *ipStats) trimHistory(now time.Time) {
+	maxWindow := avgWindows[len(avgWindows)-1] + time.Second
+	keepFrom := 0
+	for keepFrom < len(s.History) && now.Sub(s.History[keepFrom].At) > maxWindow {
+		keepFrom++
+	}
+	if keepFrom > 0 {
+		s.History = append([]statSample(nil), s.History[keepFrom:]...)
+	}
+}
+
+func (s *ipStats) ratesForWindow(now time.Time, window time.Duration) (float64, float64) {
+	if len(s.History) < 2 {
+		return 0, 0
+	}
+	current := s.History[len(s.History)-1]
+	base := s.History[0]
+	for i := len(s.History) - 2; i >= 0; i-- {
+		if now.Sub(s.History[i].At) >= window {
+			base = s.History[i]
+			break
+		}
+		base = s.History[i]
+	}
+	elapsed := current.At.Sub(base.At).Seconds()
+	if elapsed <= 0 {
+		return 0, 0
+	}
+	return float64(current.InBytes-base.InBytes) / elapsed, float64(current.OutBytes-base.OutBytes) / elapsed
 }
 
 func (m *model) refreshRows() {
@@ -886,7 +921,7 @@ func (m model) View() string {
 		mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 		mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 		mutedStyle.Render("state") + " " + valueStyle.Render(state),
-		mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
+		mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
 		mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 		mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 	}, "  ")
@@ -896,7 +931,7 @@ func (m model) View() string {
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
-			mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
+			mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
 			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 			mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 		}
@@ -914,7 +949,7 @@ func (m model) View() string {
 		hotkey(keyStyle, "tab", "iface"),
 		hotkey(keyStyle, "/", "search"),
 		hotkey(keyStyle, "space", "pause"),
-		hotkey(keyStyle, "+/-", "refresh"),
+		hotkey(keyStyle, "+/-", "avg"),
 		hotkey(keyStyle, "q", "quit"),
 	}, "  ")
 	if m.searching {
@@ -924,7 +959,7 @@ func (m model) View() string {
 			hotkey(keyStyle, "backspace", "delete"),
 			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
-			hotkey(keyStyle, "+/-", "refresh"),
+			hotkey(keyStyle, "+/-", "avg"),
 			hotkey(keyStyle, "ctrl+c", "quit"),
 		}, "  ")
 	}
@@ -934,7 +969,7 @@ func (m model) View() string {
 			mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
-			mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
+			mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
 			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 			mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 		}, "  ")
@@ -944,7 +979,7 @@ func (m model) View() string {
 				mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 				mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 				mutedStyle.Render("state") + " " + valueStyle.Render(state),
-				mutedStyle.Render("refresh") + " " + valueStyle.Render(m.refreshInterval().String()),
+				mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
 				mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
 				mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 			}
@@ -955,7 +990,7 @@ func (m model) View() string {
 			hotkey(keyStyle, "esc", "back"),
 			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
-			hotkey(keyStyle, "+/-", "refresh"),
+			hotkey(keyStyle, "+/-", "avg"),
 			hotkey(keyStyle, "q", "quit"),
 		}, "  ")
 	}
@@ -1035,7 +1070,7 @@ func hotkey(style lipgloss.Style, key, label string) string {
 }
 
 func (m model) tickCmd() tea.Cmd {
-	return tea.Tick(m.refreshInterval(), func(t time.Time) tea.Msg {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
