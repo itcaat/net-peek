@@ -111,10 +111,14 @@ func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMo
 		return nil, err
 	}
 
-	selected, err := selectCaptureDevices(devices, iface)
+	selected, err := selectCaptureDevicesForMode(devices, iface, mode)
 	if err != nil {
 		cancel()
 		return nil, err
+	}
+	localIPDevices := selected
+	if mode == modeGateway {
+		localIPDevices = devices
 	}
 
 	manager := &captureManager{
@@ -122,7 +126,7 @@ func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMo
 		errs:      make(chan error, max(1, len(selected)*2)),
 		cancel:    cancel,
 		localNets: collectLocalNets(selected),
-		localIPs:  collectLocalIPs(selected),
+		localIPs:  collectLocalIPs(localIPDevices),
 		mode:      mode,
 	}
 
@@ -132,6 +136,15 @@ func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMo
 	}
 
 	return manager, nil
+}
+
+func selectCaptureDevicesForMode(devices []pcap.Interface, iface string, mode captureMode) ([]pcap.Interface, error) {
+	if mode == modeGateway && runtime.GOOS == "linux" && (iface == "" || iface == "all") {
+		if selected, err := selectCaptureDevices(devices, "any"); err == nil {
+			return selected, nil
+		}
+	}
+	return selectCaptureDevices(devices, iface)
 }
 
 func selectCaptureDevices(devices []pcap.Interface, iface string) ([]pcap.Interface, error) {
