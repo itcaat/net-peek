@@ -148,6 +148,15 @@ func TestCaptureManagerCoalescesPacketEvents(t *testing.T) {
 	}
 }
 
+func TestNextCaptureMode(t *testing.T) {
+	if got := nextCaptureMode(modeHost); got != modeGateway {
+		t.Fatalf("nextCaptureMode(host) = %q, want gateway", got)
+	}
+	if got := nextCaptureMode(modeGateway); got != modeHost {
+		t.Fatalf("nextCaptureMode(gateway) = %q, want host", got)
+	}
+}
+
 func TestRateFormattingUsesBits(t *testing.T) {
 	if got := humanMbitRate(125000); got != "1.00Mbit/s" {
 		t.Fatalf("humanMbitRate(125000) = %q, want 1.00Mbit/s", got)

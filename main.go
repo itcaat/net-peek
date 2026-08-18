@@ -488,6 +488,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.longerAvgWindow()
 		case "tab":
 			m.openIfacePicker()
+		case "m":
+			m.toggleMode()
 		case "/":
 			if !m.inIPView() {
 				m.searching = true
@@ -585,19 +587,36 @@ func (m *model) selectIface() {
 		m.ifacePicker = false
 		return
 	}
-	nextMode := m.mode
+	if m.switchCapture(nextIface, m.mode) {
+		m.ifacePicker = false
+	}
+}
+
+func (m *model) toggleMode() {
+	nextMode := nextCaptureMode(m.mode)
+	m.switchCapture(m.iface, nextMode)
+}
+
+func nextCaptureMode(mode captureMode) captureMode {
+	if mode == modeGateway {
+		return modeHost
+	}
+	return modeGateway
+}
+
+func (m *model) switchCapture(nextIface string, nextMode captureMode) bool {
 	nextCapture, err := newCaptureManagerWithMode(context.Background(), nextIface, nextMode)
 	if err != nil {
 		m.errs = append(m.errs, err.Error())
 		if len(m.errs) > 4 {
 			m.errs = m.errs[len(m.errs)-4:]
 		}
-		return
+		return false
 	}
 	m.capture.stop()
 	m.capture = nextCapture
 	m.iface = nextIface
-	m.ifacePicker = false
+	m.mode = nextMode
 	m.selectedIP = ""
 	m.searching = false
 	m.searchQuery = ""
@@ -611,6 +630,7 @@ func (m *model) selectIface() {
 	m.lastTick = time.Now()
 	m.table.SetRows(nil)
 	m.resizeColumns()
+	return true
 }
 
 func (m *model) handleSearchKey(msg tea.KeyMsg) bool {
@@ -992,6 +1012,7 @@ func (m model) View() string {
 	}
 	keys := strings.Join([]string{
 		hotkey(keyStyle, "enter", "open"),
+		hotkey(keyStyle, "m", "mode"),
 		hotkey(keyStyle, "tab", "iface"),
 		hotkey(keyStyle, "/", "search"),
 		hotkey(keyStyle, "space", "pause"),
@@ -1003,6 +1024,7 @@ func (m model) View() string {
 			hotkey(keyStyle, "enter", "open"),
 			hotkey(keyStyle, "esc", "clear"),
 			hotkey(keyStyle, "backspace", "delete"),
+			hotkey(keyStyle, "m", "mode"),
 			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
 			hotkey(keyStyle, "+/-", "avg"),
@@ -1034,6 +1056,7 @@ func (m model) View() string {
 		keys = strings.Join([]string{
 			hotkey(keyStyle, "backspace", "back"),
 			hotkey(keyStyle, "esc", "back"),
+			hotkey(keyStyle, "m", "mode"),
 			hotkey(keyStyle, "tab", "iface"),
 			hotkey(keyStyle, "space", "pause"),
 			hotkey(keyStyle, "+/-", "avg"),
