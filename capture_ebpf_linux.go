@@ -5,13 +5,18 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
+	"syscall"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	nl "github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -29,36 +34,21 @@ func newPlatformCapture(ctx context.Context, manager *captureManager, ifaces []n
 		return fmt.Errorf("load eBPF objects: %w", err)
 	}
 
-	var links []link.Link
+	var attachments []captureAttachment
 	cleanup := func() {
-		for _, l := range links {
-			_ = l.Close()
+		for _, attachment := range attachments {
+			_ = attachment.Close()
 		}
 		_ = objs.Close()
 	}
 
 	for _, iface := range ifaces {
-		ingress, err := link.AttachTCX(link.TCXOptions{
-			Interface: iface.Index,
-			Program:   objs.IngressAccount,
-			Attach:    ebpf.AttachTCXIngress,
-		})
+		attachment, err := attachInterfacePrograms(iface, objs.IngressAccount, objs.EgressAccount)
 		if err != nil {
 			cleanup()
-			return fmt.Errorf("%s: attach eBPF TC ingress: %w", iface.Name, err)
+			return err
 		}
-		links = append(links, ingress)
-
-		egress, err := link.AttachTCX(link.TCXOptions{
-			Interface: iface.Index,
-			Program:   objs.EgressAccount,
-			Attach:    ebpf.AttachTCXEgress,
-		})
-		if err != nil {
-			cleanup()
-			return fmt.Errorf("%s: attach eBPF TC egress: %w", iface.Name, err)
-		}
-		links = append(links, egress)
+		attachments = append(attachments, attachment)
 	}
 
 	snapshots := map[bpfFlowKey]bpfFlowValue{}
@@ -90,6 +80,122 @@ func newPlatformCapture(ctx context.Context, manager *captureManager, ifaces []n
 	}()
 
 	return nil
+}
+
+type captureAttachment interface {
+	Close() error
+}
+
+type multiAttachment []captureAttachment
+
+func (m multiAttachment) Close() error {
+	var errs []error
+	for _, attachment := range m {
+		if err := attachment.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func attachInterfacePrograms(iface net.Interface, ingressProg, egressProg *ebpf.Program) (captureAttachment, error) {
+	tcx, err := attachInterfaceTCX(iface, ingressProg, egressProg)
+	if err == nil {
+		return tcx, nil
+	}
+
+	legacy, legacyErr := attachInterfaceClsact(iface, ingressProg, egressProg)
+	if legacyErr == nil {
+		return legacy, nil
+	}
+	return nil, fmt.Errorf("%s: attach eBPF TCX failed: %v; legacy clsact failed: %w", iface.Name, err, legacyErr)
+}
+
+func attachInterfaceTCX(iface net.Interface, ingressProg, egressProg *ebpf.Program) (captureAttachment, error) {
+	ingress, err := link.AttachTCX(link.TCXOptions{
+		Interface: iface.Index,
+		Program:   ingressProg,
+		Attach:    ebpf.AttachTCXIngress,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	egress, err := link.AttachTCX(link.TCXOptions{
+		Interface: iface.Index,
+		Program:   egressProg,
+		Attach:    ebpf.AttachTCXEgress,
+	})
+	if err != nil {
+		_ = ingress.Close()
+		return nil, err
+	}
+
+	return multiAttachment{ingress, egress}, nil
+}
+
+func attachInterfaceClsact(iface net.Interface, ingressProg, egressProg *ebpf.Program) (captureAttachment, error) {
+	link, err := nl.LinkByName(iface.Name)
+	if err != nil {
+		return nil, fmt.Errorf("%s: lookup netlink interface: %w", iface.Name, err)
+	}
+
+	qdisc := &nl.Clsact{
+		QdiscAttrs: nl.QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    nl.MakeHandle(0xffff, 0),
+			Parent:    nl.HANDLE_CLSACT,
+		},
+	}
+	if err := nl.QdiscAdd(qdisc); err != nil && !errors.Is(err, syscall.EEXIST) && !os.IsExist(err) {
+		return nil, fmt.Errorf("%s: add clsact qdisc: %w", iface.Name, err)
+	}
+
+	handleBase := uint16(os.Getpid() & 0xffff)
+	if handleBase == 0 {
+		handleBase = 1
+	}
+	ingressFilter := bpfTCFilter(link.Attrs().Index, nl.HANDLE_MIN_INGRESS, nl.MakeHandle(handleBase, 1), "netpeek_ingress", ingressProg)
+	if err := nl.FilterAdd(ingressFilter); err != nil {
+		return nil, fmt.Errorf("%s: add clsact ingress filter: %w", iface.Name, err)
+	}
+
+	egressFilter := bpfTCFilter(link.Attrs().Index, nl.HANDLE_MIN_EGRESS, nl.MakeHandle(handleBase, 2), "netpeek_egress", egressProg)
+	if err := nl.FilterAdd(egressFilter); err != nil {
+		_ = nl.FilterDel(ingressFilter)
+		return nil, fmt.Errorf("%s: add clsact egress filter: %w", iface.Name, err)
+	}
+
+	return legacyTCAttachment{filters: []*nl.BpfFilter{ingressFilter, egressFilter}}, nil
+}
+
+func bpfTCFilter(linkIndex int, parent, handle uint32, name string, program *ebpf.Program) *nl.BpfFilter {
+	return &nl.BpfFilter{
+		FilterAttrs: nl.FilterAttrs{
+			LinkIndex: linkIndex,
+			Parent:    parent,
+			Handle:    handle,
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  1,
+		},
+		Fd:           program.FD(),
+		Name:         name,
+		DirectAction: true,
+	}
+}
+
+type legacyTCAttachment struct {
+	filters []*nl.BpfFilter
+}
+
+func (a legacyTCAttachment) Close() error {
+	var errs []error
+	for _, filter := range a.filters {
+		if err := nl.FilterDel(filter); err != nil && !errors.Is(err, syscall.ENOENT) && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (m *captureManager) bpfFlowToEvents(key bpfFlowKey, bytes uint64) []packetEvent {

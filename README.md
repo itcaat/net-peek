@@ -16,9 +16,9 @@ It shows:
 - Linux with eBPF support
 - root or `CAP_BPF`/`CAP_NET_ADMIN` privileges
 
-`net-peek` uses TC eBPF programs attached to ingress and egress of selected interfaces. It does not require `libpcap`, `tcpdump`, `ss`, or `tc`.
+`net-peek` uses TC eBPF programs attached to ingress and egress of selected interfaces. It does not require `libpcap`, `tcpdump`, `ss`, or the external `tc` command.
 
-The current backend uses TCX attach, which requires Linux 6.6 or newer.
+On Linux 6.6+ it uses TCX attach. On older kernels it falls back to legacy `clsact` TC filters via netlink.
 
 You can usually run it with `sudo`:
 
