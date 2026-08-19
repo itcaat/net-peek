@@ -3,7 +3,10 @@ SHELL := /bin/bash
 REMOTE ?= origin
 TAG_PREFIX ?= v
 
-.PHONY: test build snapshot next-tag next-beta beta release
+.PHONY: generate test build build-linux snapshot next-tag next-beta beta release
+
+generate:
+	go generate -tags linux ./...
 
 test:
 	go test ./...
@@ -11,10 +14,14 @@ test:
 build:
 	go build -o net-peek .
 
+build-linux:
+	GOOS=linux GOARCH=amd64 go build -trimpath -o dist/net-peek_linux_amd64 .
+	GOOS=linux GOARCH=arm64 go build -trimpath -o dist/net-peek_linux_arm64 .
+
 snapshot:
 	@rm -rf dist/package
 	@mkdir -p dist/package
-	go build -trimpath -o dist/package/net-peek .
+	GOOS=linux GOARCH=$$(go env GOARCH) go build -trimpath -o dist/package/net-peek .
 	@cp README.md dist/package/
 	@if compgen -G "LICENSE*" > /dev/null; then cp LICENSE* dist/package/; fi
 	@tar -czf "dist/net-peek_snapshot_$$(go env GOOS)_$$(go env GOARCH).tar.gz" -C dist/package .

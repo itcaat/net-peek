@@ -17,15 +17,9 @@ jobs:
         include:
           - runner: ubuntu-latest
             asset: linux_amd64
-            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+            install: "true"
           - runner: ubuntu-24.04-arm
             asset: linux_arm64
-            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
-          - runner: macos-15-intel
-            asset: darwin_amd64
-            install: "true"
-          - runner: macos-15
-            asset: darwin_arm64
             install: "true"
 
     steps:
