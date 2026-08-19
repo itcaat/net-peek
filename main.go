@@ -21,14 +21,10 @@ import (
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 )
 
 const (
-	defaultSnapLen = 65535
-	connInterval   = 2 * time.Second
+	connInterval = 2 * time.Second
 )
 
 var avgWindows = []time.Duration{
@@ -44,6 +40,11 @@ var (
 	date    = "unknown"
 )
 
+var clientCandidateNets = []*net.IPNet{
+	mustParseCIDR("100.64.0.0/10"),
+	mustParseCIDR("fc00::/7"),
+}
+
 type direction uint8
 
 const (
@@ -53,6 +54,9 @@ const (
 
 type packetEvent struct {
 	remoteIP string
+	peerIP   string
+	proto    string
+	flowID   string
 	dir      direction
 	bytes    uint64
 }
@@ -60,6 +64,27 @@ type packetEvent struct {
 type trafficCounters struct {
 	InBytes  uint64
 	OutBytes uint64
+}
+
+type trafficDeltas struct {
+	IPs   map[string]trafficCounters
+	Flows map[string]flowDelta
+}
+
+type flowDelta struct {
+	ClientIP string
+	RemoteIP string
+	Proto    string
+	InBytes  uint64
+	OutBytes uint64
+}
+
+type gatewayFlowOwner struct {
+	ClientIP   string
+	RemoteIP   string
+	ClientPort string
+	RemotePort string
+	Proto      string
 }
 
 type captureMode string
@@ -75,6 +100,7 @@ type ipStats struct {
 	OutBytes    uint64
 	InRate      float64
 	OutRate     float64
+	FlowCount   int
 	Connections []connection
 	History     []statSample
 }
@@ -101,14 +127,43 @@ type connection struct {
 	PID    string
 }
 
+type flowStats struct {
+	ClientIP string
+	RemoteIP string
+	Proto    string
+	InBytes  uint64
+	OutBytes uint64
+	InRate   float64
+	OutRate  float64
+	LastSeen time.Time
+	History  []statSample
+}
+
+func (s flowStats) Total() uint64 {
+	return s.InBytes + s.OutBytes
+}
+
+func (s flowStats) TotalRate() float64 {
+	return s.InRate + s.OutRate
+}
+
+func activeFlowWindow() time.Duration {
+	return 30 * time.Second
+}
+
 type captureManager struct {
-	errs      chan error
-	cancel    context.CancelFunc
-	mu        sync.Mutex
-	pending   map[string]trafficCounters
-	localNets []*net.IPNet
-	localIPs  map[string]struct{}
-	mode      captureMode
+	errs             chan error
+	cancel           context.CancelFunc
+	mu               sync.Mutex
+	pending          map[string]trafficCounters
+	flows            map[string]flowDelta
+	owners           map[string]gatewayFlowOwner
+	localNets        []*net.IPNet
+	ifaceNets        map[int][]*net.IPNet
+	localIPs         map[string]struct{}
+	mode             captureMode
+	closeFn          func()
+	readKernelDeltas func(*captureManager)
 }
 
 func newCaptureManager(ctx context.Context, iface string) (*captureManager, error) {
@@ -117,94 +172,79 @@ func newCaptureManager(ctx context.Context, iface string) (*captureManager, erro
 
 func newCaptureManagerWithMode(ctx context.Context, iface string, mode captureMode) (*captureManager, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	devices, err := pcap.FindAllDevs()
+	ifaces, err := selectNetworkInterfaces(iface)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-
-	selected, err := selectCaptureDevicesForMode(devices, iface, mode)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	localIPDevices := selected
+	allIfaces := ifaces
 	if mode == modeGateway {
-		localIPDevices = devices
+		allIfaces, err = usableNetworkInterfaces()
+		if err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
 	manager := &captureManager{
-		errs:      make(chan error, max(1, len(selected)*2)),
+		errs:      make(chan error, max(1, len(ifaces)*2)),
 		cancel:    cancel,
 		pending:   map[string]trafficCounters{},
-		localNets: collectLocalNets(selected),
-		localIPs:  collectLocalIPs(localIPDevices),
+		flows:     map[string]flowDelta{},
+		owners:    map[string]gatewayFlowOwner{},
+		localNets: collectLocalNets(ifaces),
+		ifaceNets: collectInterfaceNets(ifaces),
+		localIPs:  collectLocalIPs(allIfaces),
 		mode:      mode,
 	}
 
-	for _, dev := range selected {
-		dev := dev
-		go manager.captureInterface(ctx, dev.Name)
+	if err := newPlatformCapture(ctx, manager, ifaces); err != nil {
+		cancel()
+		return nil, err
 	}
 
 	return manager, nil
 }
 
-func selectCaptureDevicesForMode(devices []pcap.Interface, iface string, mode captureMode) ([]pcap.Interface, error) {
-	if mode == modeGateway && runtime.GOOS == "linux" && (iface == "" || iface == "all") {
-		if selected, err := selectCaptureDevices(devices, "any"); err == nil {
-			return selected, nil
-		}
+func selectNetworkInterfaces(iface string) ([]net.Interface, error) {
+	if iface == "" || iface == "all" {
+		return usableNetworkInterfaces()
 	}
-	return selectCaptureDevices(devices, iface)
+	dev, err := net.InterfaceByName(iface)
+	if err != nil {
+		return nil, fmt.Errorf("interface %q not found", iface)
+	}
+	if !isUsableInterface(dev) {
+		return nil, fmt.Errorf("interface %q is not up or is loopback", iface)
+	}
+	return []net.Interface{*dev}, nil
 }
 
-func selectCaptureDevices(devices []pcap.Interface, iface string) ([]pcap.Interface, error) {
-	selected := devices
-	if iface != "all" && iface != "" {
-		selected = nil
-		for _, dev := range devices {
-			if dev.Name == iface {
-				selected = append(selected, dev)
-				break
-			}
+func usableNetworkInterfaces() ([]net.Interface, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	selected := make([]net.Interface, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if isUsableInterface(&iface) {
+			selected = append(selected, iface)
 		}
-		if len(selected) == 0 {
-			return nil, fmt.Errorf("interface %q not found", iface)
-		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("no usable network interfaces found")
 	}
 	return selected, nil
 }
 
-func (m *captureManager) stop() {
-	m.cancel()
+func isUsableInterface(iface *net.Interface) bool {
+	return iface != nil && iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0
 }
 
-func (m *captureManager) captureInterface(ctx context.Context, name string) {
-	handle, err := pcap.OpenLive(name, defaultSnapLen, true, pcap.BlockForever)
-	if err != nil {
-		m.errs <- fmt.Errorf("%s: %w", name, err)
-		return
-	}
-	defer handle.Close()
-
-	if err := handle.SetBPFFilter("ip or ip6"); err != nil {
-		m.errs <- fmt.Errorf("%s: set BPF filter: %w", name, err)
-		return
-	}
-
-	source := gopacket.NewPacketSource(handle, handle.LinkType())
-	packets := source.Packets()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case packet, ok := <-packets:
-			if !ok {
-				return
-			}
-			m.addPacketEvents(m.packetToEvents(packet))
-		}
+func (m *captureManager) stop() {
+	m.cancel()
+	if m.closeFn != nil {
+		m.closeFn()
 	}
 }
 
@@ -222,36 +262,48 @@ func (m *captureManager) addPacketEvents(events []packetEvent) {
 			counters.OutBytes += ev.bytes
 		}
 		m.pending[ev.remoteIP] = counters
+		if ev.flowID != "" {
+			flow := m.flows[ev.flowID]
+			if flow.ClientIP == "" {
+				flow.ClientIP = ev.remoteIP
+				flow.RemoteIP = ev.peerIP
+				flow.Proto = ev.proto
+			}
+			if ev.dir == dirIn {
+				flow.InBytes += ev.bytes
+			} else {
+				flow.OutBytes += ev.bytes
+			}
+			m.flows[ev.flowID] = flow
+		}
 	}
 }
 
-func (m *captureManager) drainDeltas() map[string]trafficCounters {
+func (m *captureManager) drainDeltas() trafficDeltas {
+	if m.readKernelDeltas != nil {
+		m.readKernelDeltas(m)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.pending) == 0 {
-		return nil
+	if len(m.pending) == 0 && len(m.flows) == 0 {
+		return trafficDeltas{}
 	}
-	deltas := m.pending
+	deltas := trafficDeltas{IPs: m.pending, Flows: m.flows}
 	m.pending = map[string]trafficCounters{}
+	m.flows = map[string]flowDelta{}
 	return deltas
 }
 
-func (m *captureManager) packetToEvents(packet gopacket.Packet) []packetEvent {
-	length := uint64(len(packet.Data()))
-	if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-		ipv4 := ipv4Layer.(*layers.IPv4)
-		return m.ipPairToEvents(ipv4.SrcIP, ipv4.DstIP, length)
-	}
-	if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
-		ipv6 := ipv6Layer.(*layers.IPv6)
-		return m.ipPairToEvents(ipv6.SrcIP, ipv6.DstIP, length)
-	}
-	return nil
+type flowMeta struct {
+	Proto   string
+	SrcPort string
+	DstPort string
 }
 
-func (m *captureManager) ipPairToEvents(src, dst net.IP, bytes uint64) []packetEvent {
+func (m *captureManager) ipPairToEvents(src, dst net.IP, meta flowMeta, bytes uint64) []packetEvent {
 	if m.mode == modeGateway {
-		return m.gatewayIPPairToEvents(src, dst, bytes)
+		return m.gatewayIPPairToEvents(src, dst, meta, bytes)
 	}
 
 	srcLocal := containsIP(m.localNets, src)
@@ -269,58 +321,139 @@ func (m *captureManager) ipPairToEvents(src, dst net.IP, bytes uint64) []packetE
 	}
 }
 
-func (m *captureManager) gatewayIPPairToEvents(src, dst net.IP, bytes uint64) []packetEvent {
-	events := make([]packetEvent, 0, 2)
-	if !isLocalish(src.String()) && m.gatewayIPAllowed(src) {
-		events = append(events, packetEvent{remoteIP: src.String(), dir: dirOut, bytes: bytes})
+func (m *captureManager) gatewayIPPairToEvents(src, dst net.IP, meta flowMeta, bytes uint64) []packetEvent {
+	srcClient := m.gatewayClientAllowed(src)
+	dstClient := m.gatewayClientAllowed(dst)
+	if !srcClient && !dstClient {
+		return nil
 	}
-	if !isLocalish(dst.String()) && m.gatewayIPAllowed(dst) {
-		events = append(events, packetEvent{remoteIP: dst.String(), dir: dirIn, bytes: bytes})
+
+	srcIP := src.String()
+	dstIP := dst.String()
+	owner := gatewayFlowOwner{}
+	switch {
+	case srcClient && !dstClient:
+		owner = gatewayFlowOwner{ClientIP: srcIP, RemoteIP: dstIP, ClientPort: meta.SrcPort, RemotePort: meta.DstPort, Proto: meta.Proto}
+	case dstClient && !srcClient:
+		owner = gatewayFlowOwner{ClientIP: dstIP, RemoteIP: srcIP, ClientPort: meta.DstPort, RemotePort: meta.SrcPort, Proto: meta.Proto}
+	default:
+		owner = m.gatewayPrivateFlowOwner(srcIP, dstIP, meta)
 	}
-	return events
+	if owner.ClientIP == "" {
+		return nil
+	}
+
+	dir := dirIn
+	if srcIP == owner.ClientIP && meta.SrcPort == owner.ClientPort {
+		dir = dirOut
+	} else if meta.SrcPort == "" && srcIP == owner.ClientIP {
+		dir = dirOut
+	}
+
+	return []packetEvent{{
+		remoteIP: owner.ClientIP,
+		peerIP:   owner.RemoteIP,
+		proto:    owner.Proto,
+		flowID:   gatewayFlowID(owner.ClientIP, owner.RemoteIP, owner.Proto, owner.ClientPort, owner.RemotePort),
+		dir:      dir,
+		bytes:    bytes,
+	}}
 }
 
-func (m *captureManager) gatewayIPAllowed(ip net.IP) bool {
+func (m *captureManager) gatewayPrivateFlowOwner(srcIP, dstIP string, meta flowMeta) gatewayFlowOwner {
+	key := canonicalGatewayFlowKey(srcIP, dstIP, meta)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if owner, ok := m.owners[key]; ok {
+		return owner
+	}
+	owner := gatewayFlowOwner{
+		ClientIP:   srcIP,
+		RemoteIP:   dstIP,
+		ClientPort: meta.SrcPort,
+		RemotePort: meta.DstPort,
+		Proto:      meta.Proto,
+	}
+	m.owners[key] = owner
+	return owner
+}
+
+func (m *captureManager) gatewayClientAllowed(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
 	_, local := m.localIPs[ip.String()]
-	return !local
+	return !local && isClientCandidateIP(ip)
 }
 
-func collectLocalNets(devices []pcap.Interface) []*net.IPNet {
+func gatewayFlowID(clientIP, remoteIP, proto, clientPort, remotePort string) string {
+	return strings.Join([]string{clientIP, clientPort, remoteIP, remotePort, proto}, "|")
+}
+
+func canonicalGatewayFlowKey(srcIP, dstIP string, meta flowMeta) string {
+	left := srcIP + ":" + meta.SrcPort
+	right := dstIP + ":" + meta.DstPort
+	if left > right {
+		left, right = right, left
+	}
+	return strings.Join([]string{left, right, meta.Proto}, "|")
+}
+
+func collectLocalNets(ifaces []net.Interface) []*net.IPNet {
 	var nets []*net.IPNet
-	for _, dev := range devices {
-		for _, addr := range dev.Addresses {
-			ip := addr.IP
-			if ip == nil || ip.IsUnspecified() {
-				continue
-			}
-			mask := addr.Netmask
-			if len(mask) == 0 {
-				if ip.To4() != nil {
-					mask = net.CIDRMask(32, 32)
-				} else {
-					mask = net.CIDRMask(128, 128)
-				}
-			}
-			nets = append(nets, &net.IPNet{IP: ip.Mask(mask), Mask: mask})
-		}
+	for _, iface := range ifaces {
+		nets = append(nets, interfaceNets(iface)...)
 	}
 	return nets
 }
 
-func collectLocalIPs(devices []pcap.Interface) map[string]struct{} {
+func collectInterfaceNets(ifaces []net.Interface) map[int][]*net.IPNet {
+	nets := map[int][]*net.IPNet{}
+	for _, iface := range ifaces {
+		nets[iface.Index] = interfaceNets(iface)
+	}
+	return nets
+}
+
+func interfaceNets(iface net.Interface) []*net.IPNet {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	nets := make([]*net.IPNet, 0, len(addrs))
+	for _, addr := range addrs {
+		ip, n, ok := addrToIPNet(addr)
+		if !ok {
+			continue
+		}
+		nets = append(nets, &net.IPNet{IP: ip.Mask(n.Mask), Mask: n.Mask})
+	}
+	return nets
+}
+
+func collectLocalIPs(ifaces []net.Interface) map[string]struct{} {
 	ips := map[string]struct{}{}
-	for _, dev := range devices {
-		for _, addr := range dev.Addresses {
-			if addr.IP == nil || addr.IP.IsUnspecified() {
-				continue
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip, _, ok := addrToIPNet(addr)
+			if ok {
+				ips[ip.String()] = struct{}{}
 			}
-			ips[addr.IP.String()] = struct{}{}
 		}
 	}
 	return ips
+}
+
+func addrToIPNet(addr net.Addr) (net.IP, *net.IPNet, bool) {
+	ipNet, ok := addr.(*net.IPNet)
+	if !ok || ipNet.IP == nil || ipNet.IP.IsUnspecified() {
+		return nil, nil, false
+	}
+	return ipNet.IP, ipNet, true
 }
 
 func containsIP(nets []*net.IPNet, ip net.IP) bool {
@@ -331,6 +464,19 @@ func containsIP(nets []*net.IPNet, ip net.IP) bool {
 		if n.Contains(ip) {
 			return true
 		}
+	}
+	return false
+}
+
+func isClientCandidateIP(ip net.IP) bool {
+	if ip == nil || isLocalish(ip.String()) {
+		return false
+	}
+	if ip.IsPrivate() {
+		return true
+	}
+	if containsIP(clientCandidateNets, ip) {
+		return true
 	}
 	return false
 }
@@ -378,6 +524,7 @@ type model struct {
 	iface         string
 	mode          captureMode
 	stats         map[string]*ipStats
+	flows         map[string]*flowStats
 	connections   map[string][]connection
 	table         table.Model
 	selectedIP    string
@@ -430,6 +577,7 @@ func newModel(capture *captureManager, iface string, mode captureMode) model {
 		iface:       iface,
 		mode:        mode,
 		stats:       map[string]*ipStats{},
+		flows:       map[string]*flowStats{},
 		connections: map[string][]connection{},
 		table:       t,
 		sortField:   initial.sortField,
@@ -621,6 +769,7 @@ func (m *model) switchCapture(nextIface string, nextMode captureMode) bool {
 	m.searching = false
 	m.searchQuery = ""
 	m.stats = map[string]*ipStats{}
+	m.flows = map[string]*flowStats{}
 	m.connections = map[string][]connection{}
 	m.totalInBytes = 0
 	m.totalOutBytes = 0
@@ -715,7 +864,9 @@ func (m model) avgWindow() time.Duration {
 }
 
 func (m *model) drainEvents() {
-	for ip, delta := range m.capture.drainDeltas() {
+	now := time.Now()
+	deltas := m.capture.drainDeltas()
+	for ip, delta := range deltas.IPs {
 		stat := m.stats[ip]
 		if stat == nil {
 			stat = &ipStats{IP: ip}
@@ -725,6 +876,20 @@ func (m *model) drainEvents() {
 		stat.OutBytes += delta.OutBytes
 		m.totalInBytes += delta.InBytes
 		m.totalOutBytes += delta.OutBytes
+	}
+	for id, delta := range deltas.Flows {
+		flow := m.flows[id]
+		if flow == nil {
+			flow = &flowStats{
+				ClientIP: delta.ClientIP,
+				RemoteIP: delta.RemoteIP,
+				Proto:    delta.Proto,
+			}
+			m.flows[id] = flow
+		}
+		flow.InBytes += delta.InBytes
+		flow.OutBytes += delta.OutBytes
+		flow.LastSeen = now
 	}
 
 	for {
@@ -743,6 +908,20 @@ func (m *model) updateRates(now time.Time) {
 	m.totalHistory = append(m.totalHistory, statSample{At: now, InBytes: m.totalInBytes, OutBytes: m.totalOutBytes})
 	m.totalHistory = trimStatHistory(m.totalHistory, now)
 	m.totalInRate, m.totalOutRate = ratesForHistory(m.totalHistory, now, m.avgWindow())
+
+	for _, stat := range m.stats {
+		stat.FlowCount = 0
+	}
+	for _, flow := range m.flows {
+		flow.History = append(flow.History, statSample{At: now, InBytes: flow.InBytes, OutBytes: flow.OutBytes})
+		flow.History = trimStatHistory(flow.History, now)
+		flow.InRate, flow.OutRate = ratesForHistory(flow.History, now, m.avgWindow())
+		if now.Sub(flow.LastSeen) <= activeFlowWindow() {
+			if stat := m.stats[flow.ClientIP]; stat != nil {
+				stat.FlowCount++
+			}
+		}
+	}
 
 	for _, stat := range m.stats {
 		stat.History = append(stat.History, statSample{At: now, InBytes: stat.InBytes, OutBytes: stat.OutBytes})
@@ -807,9 +986,9 @@ func (m *model) refreshRows() {
 		stats = append(stats, stat)
 	}
 	sort.Slice(stats, func(i, j int) bool {
-		cmp := compareStats(stats[i], stats[j], m.sortField)
+		cmp := compareStats(stats[i], stats[j], m.sortField, m.mode)
 		if cmp == 0 {
-			cmp = compareStats(stats[i], stats[j], sortTotalRate)
+			cmp = compareStats(stats[i], stats[j], sortTotalRate, m.mode)
 		}
 		if cmp == 0 {
 			cmp = strings.Compare(stats[i].IP, stats[j].IP)
@@ -824,7 +1003,7 @@ func (m *model) refreshRows() {
 	for _, stat := range stats {
 		rows = append(rows, table.Row{
 			stat.IP,
-			strconv.Itoa(len(stat.Connections)),
+			strconv.Itoa(statConnectionCount(stat, m.mode)),
 			humanBitRate(stat.InRate),
 			humanBitRate(stat.OutRate),
 			humanBytes(float64(stat.InBytes)),
@@ -836,6 +1015,11 @@ func (m *model) refreshRows() {
 }
 
 func (m *model) refreshConnectionRows() {
+	if m.mode == modeGateway {
+		m.refreshGatewayFlowRows()
+		return
+	}
+
 	conns := append([]connection(nil), m.connections[m.selectedIP]...)
 	sort.Slice(conns, func(i, j int) bool {
 		if conns[i].Remote == conns[j].Remote {
@@ -857,12 +1041,44 @@ func (m *model) refreshConnectionRows() {
 	m.table.SetRows(rows)
 }
 
-func compareStats(a, b *ipStats, field sortField) int {
+func (m *model) refreshGatewayFlowRows() {
+	flows := make([]*flowStats, 0)
+	for _, flow := range m.flows {
+		if flow.ClientIP == m.selectedIP {
+			flows = append(flows, flow)
+		}
+	}
+	sort.Slice(flows, func(i, j int) bool {
+		if flows[i].TotalRate() == flows[j].TotalRate() {
+			if flows[i].RemoteIP == flows[j].RemoteIP {
+				return flows[i].Proto < flows[j].Proto
+			}
+			return flows[i].RemoteIP < flows[j].RemoteIP
+		}
+		return flows[i].TotalRate() > flows[j].TotalRate()
+	})
+
+	rows := make([]table.Row, 0, len(flows))
+	for _, flow := range flows {
+		rows = append(rows, table.Row{
+			flow.RemoteIP,
+			flow.Proto,
+			humanBitRate(flow.InRate),
+			humanBitRate(flow.OutRate),
+			humanBytes(float64(flow.InBytes)),
+			humanBytes(float64(flow.OutBytes)),
+			humanBytes(float64(flow.Total())),
+		})
+	}
+	m.table.SetRows(rows)
+}
+
+func compareStats(a, b *ipStats, field sortField, mode captureMode) int {
 	switch field {
 	case sortIP:
 		return strings.Compare(a.IP, b.IP)
 	case sortConnections:
-		return compareInt(len(a.Connections), len(b.Connections))
+		return compareInt(statConnectionCount(a, mode), statConnectionCount(b, mode))
 	case sortInRate:
 		return compareFloat(a.InRate, b.InRate)
 	case sortOutRate:
@@ -876,6 +1092,13 @@ func compareStats(a, b *ipStats, field sortField) int {
 	default:
 		return compareFloat(a.TotalRate(), b.TotalRate())
 	}
+}
+
+func statConnectionCount(stat *ipStats, mode captureMode) int {
+	if mode == modeGateway {
+		return stat.FlowCount
+	}
+	return len(stat.Connections)
 }
 
 func compareInt(a, b int) int {
@@ -916,6 +1139,19 @@ func (m *model) resizeColumns() {
 		return
 	}
 	if m.inIPView() {
+		if m.mode == modeGateway {
+			remoteWidth := max(18, min(42, m.width-72))
+			m.table.SetColumns([]table.Column{
+				{Title: "Destination", Width: remoteWidth},
+				{Title: "Proto", Width: 7},
+				{Title: "Down/s", Width: 11},
+				{Title: "Up/s", Width: 11},
+				{Title: "Total Down", Width: 13},
+				{Title: "Total Up", Width: 12},
+				{Title: "Total", Width: 12},
+			})
+			return
+		}
 		remoteWidth := max(20, min(48, m.width-60))
 		localWidth := max(18, min(42, m.width-78))
 		m.table.SetColumns([]table.Column{
@@ -933,6 +1169,17 @@ func (m *model) resizeColumns() {
 }
 
 func (m model) ipColumns(ipWidth int) []table.Column {
+	if m.mode == modeGateway {
+		return []table.Column{
+			{Title: m.sortColumnTitle(sortIP, "client [i]p"), Width: ipWidth},
+			{Title: m.sortColumnTitle(sortConnections, "[c]onn"), Width: 8},
+			{Title: m.sortColumnTitle(sortInRate, "down/[r]"), Width: 11},
+			{Title: m.sortColumnTitle(sortOutRate, "up/[o]"), Width: 11},
+			{Title: m.sortColumnTitle(sortTotalIn, "total dow[n]"), Width: 14},
+			{Title: m.sortColumnTitle(sortTotalOut, "total [u]p"), Width: 15},
+			{Title: m.sortColumnTitle(sortTotal, "[t]otal"), Width: 12},
+		}
+	}
 	return []table.Column{
 		{Title: m.sortColumnTitle(sortIP, "[i]p"), Width: ipWidth},
 		{Title: m.sortColumnTitle(sortConnections, "[c]onn"), Width: 8},
@@ -982,13 +1229,17 @@ func (m model) View() string {
 		state = "paused"
 	}
 	totalInRate, totalOutRate := m.totalRates()
+	rateText := "in " + humanMbitRate(totalInRate) + " out " + humanMbitRate(totalOutRate)
+	if m.mode == modeGateway {
+		rateText = "down " + humanMbitRate(totalInRate) + " up " + humanMbitRate(totalOutRate)
+	}
 	primary := strings.Join([]string{
 		titleStyle.Render("net-peek"),
 		mutedStyle.Render("mode") + " " + valueStyle.Render(string(m.mode)),
 		mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 		mutedStyle.Render("state") + " " + valueStyle.Render(state),
 		mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
-		mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
+		mutedStyle.Render("rate") + " " + valueStyle.Render(rateText),
 		mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 	}, "  ")
 	if m.mode == modeGateway {
@@ -998,7 +1249,7 @@ func (m model) View() string {
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
 			mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
-			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
+			mutedStyle.Render("rate") + " " + valueStyle.Render(rateText),
 			mutedStyle.Render("sorted") + " " + valueStyle.Render(m.sortField.String()+" "+direction),
 		}
 		primary = strings.Join(parts, "  ")
@@ -1038,7 +1289,7 @@ func (m model) View() string {
 			mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 			mutedStyle.Render("state") + " " + valueStyle.Render(state),
 			mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
-			mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
+			mutedStyle.Render("rate") + " " + valueStyle.Render(rateText),
 			mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 		}, "  ")
 		if m.mode == modeGateway {
@@ -1048,7 +1299,7 @@ func (m model) View() string {
 				mutedStyle.Render("iface") + " " + valueStyle.Render(m.iface),
 				mutedStyle.Render("state") + " " + valueStyle.Render(state),
 				mutedStyle.Render("avg") + " " + valueStyle.Render(m.avgWindow().String()),
-				mutedStyle.Render("rate") + " " + valueStyle.Render("in "+humanMbitRate(totalInRate)+" out "+humanMbitRate(totalOutRate)),
+				mutedStyle.Render("rate") + " " + valueStyle.Render(rateText),
 				mutedStyle.Render("ip") + " " + valueStyle.Render(m.selectedIP),
 			}
 			primary = strings.Join(parts, "  ")
@@ -1085,12 +1336,16 @@ func (m model) View() string {
 
 	status := mutedStyle.Render("capturing packets; totals are since start")
 	if m.mode == modeGateway {
-		status = mutedStyle.Render("gateway mode aggregates captured packets by endpoint IP; connections are local sockets only")
+		status = mutedStyle.Render("gateway mode shows private/CGNAT/ULA client candidates; enter opens destinations")
 	}
 	if m.inIPView() {
 		stat := m.stats[m.selectedIP]
 		if stat != nil {
-			status = mutedStyle.Render("connections: " + strconv.Itoa(len(m.connections[m.selectedIP])) + " | in: " + humanBytes(float64(stat.InBytes)) + " | out: " + humanBytes(float64(stat.OutBytes)) + " | rate: " + humanBitRate(stat.TotalRate()))
+			if m.mode == modeGateway {
+				status = mutedStyle.Render("flows: " + strconv.Itoa(stat.FlowCount) + " | down: " + humanBytes(float64(stat.InBytes)) + " | up: " + humanBytes(float64(stat.OutBytes)) + " | rate: " + humanBitRate(stat.TotalRate()))
+			} else {
+				status = mutedStyle.Render("connections: " + strconv.Itoa(len(m.connections[m.selectedIP])) + " | in: " + humanBytes(float64(stat.InBytes)) + " | out: " + humanBytes(float64(stat.OutBytes)) + " | rate: " + humanBitRate(stat.TotalRate()))
+			}
 		} else {
 			status = mutedStyle.Render("no traffic stats for selected IP yet")
 		}
@@ -1101,11 +1356,27 @@ func (m model) View() string {
 	if len(m.stats) == 0 && !m.inIPView() {
 		status += "\n" + mutedStyle.Render("No packets yet. Try running as root or choose a busy interface.")
 	}
-	if m.inIPView() && len(m.connections[m.selectedIP]) == 0 {
-		status += "\n" + mutedStyle.Render("No established connections for this IP right now.")
+	if m.inIPView() {
+		if m.mode == modeGateway {
+			if m.gatewayFlowCount(m.selectedIP) == 0 {
+				status += "\n" + mutedStyle.Render("No destinations for this client yet.")
+			}
+		} else if len(m.connections[m.selectedIP]) == 0 {
+			status += "\n" + mutedStyle.Render("No established connections for this IP right now.")
+		}
 	}
 
 	return boxStyle.Render(header + "\n\n" + body + "\n\n" + status)
+}
+
+func (m model) gatewayFlowCount(clientIP string) int {
+	count := 0
+	for _, flow := range m.flows {
+		if flow.ClientIP == clientIP {
+			count++
+		}
+	}
+	return count
 }
 
 func (m model) renderIfacePicker(mutedStyle, valueStyle lipgloss.Style) string {
@@ -1407,6 +1678,14 @@ func normalizeIP(ip string) string {
 	return parsed.String()
 }
 
+func mustParseCIDR(cidr string) *net.IPNet {
+	_, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
 func isLocalish(ip string) bool {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
@@ -1461,14 +1740,16 @@ func availableInterfaces() (string, error) {
 }
 
 func availableInterfaceNames() ([]string, error) {
-	devices, err := pcap.FindAllDevs()
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(devices)+1)
+	names := make([]string, 0, len(ifaces)+1)
 	names = append(names, "all")
-	for _, dev := range devices {
-		names = append(names, dev.Name)
+	for _, iface := range ifaces {
+		if isUsableInterface(&iface) {
+			names = append(names, iface.Name)
+		}
 	}
 	if len(names) > 1 {
 		sort.Strings(names[1:])

@@ -97,17 +97,16 @@ func TestGroupConnectionsFromProc(t *testing.T) {
 func TestGatewayIPPairToEvent(t *testing.T) {
 	manager := &captureManager{mode: modeGateway, localIPs: map[string]struct{}{}}
 
-	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), 120)
-	if len(events) != 2 {
-		t.Fatalf("expected two gateway events, got %#v", events)
+	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.23"), net.ParseIP("8.8.8.8"), flowMeta{Proto: "tcp", SrcPort: "12345", DstPort: "443"}, 120)
+	if len(events) != 1 {
+		t.Fatalf("expected one gateway client event, got %#v", events)
 	}
 	out := events[0]
-	if out.remoteIP != "10.147.17.23" || out.dir != dirOut || out.bytes != 120 {
+	if out.remoteIP != "10.147.17.23" || out.peerIP != "8.8.8.8" || out.dir != dirOut || out.bytes != 120 {
 		t.Fatalf("unexpected outbound event: %#v", out)
 	}
-	in := events[1]
-	if in.remoteIP != "8.8.8.8" || in.dir != dirIn || in.bytes != 120 {
-		t.Fatalf("unexpected inbound event: %#v", in)
+	if out.flowID != "10.147.17.23|12345|8.8.8.8|443|tcp" {
+		t.Fatalf("unexpected flow id: %q", out.flowID)
 	}
 }
 
@@ -117,12 +116,58 @@ func TestGatewaySkipsLocalNodeIP(t *testing.T) {
 		localIPs: map[string]struct{}{"10.147.17.1": {}},
 	}
 
-	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.1"), net.ParseIP("10.147.17.23"), 100)
+	events := manager.gatewayIPPairToEvents(net.ParseIP("10.147.17.1"), net.ParseIP("10.147.17.23"), flowMeta{Proto: "udp"}, 100)
 	if len(events) != 1 {
 		t.Fatalf("expected only remote client event, got %#v", events)
 	}
 	if events[0].remoteIP != "10.147.17.23" || events[0].dir != dirIn {
 		t.Fatalf("unexpected event: %#v", events[0])
+	}
+}
+
+func TestGatewaySkipsPublicEndpointAsClient(t *testing.T) {
+	manager := &captureManager{mode: modeGateway, localIPs: map[string]struct{}{}}
+
+	events := manager.gatewayIPPairToEvents(net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1"), flowMeta{Proto: "tcp"}, 100)
+	if len(events) != 0 {
+		t.Fatalf("expected public endpoint packet to be skipped, got %#v", events)
+	}
+}
+
+func TestGatewayPrivateFlowKeepsInitialClientOwner(t *testing.T) {
+	manager := &captureManager{mode: modeGateway, localIPs: map[string]struct{}{}, owners: map[string]gatewayFlowOwner{}}
+	meta := flowMeta{Proto: "tcp", SrcPort: "50000", DstPort: "443"}
+
+	out := manager.gatewayIPPairToEvents(net.ParseIP("10.0.0.2"), net.ParseIP("10.37.0.10"), meta, 100)
+	if len(out) != 1 {
+		t.Fatalf("expected outbound private flow event, got %#v", out)
+	}
+	if out[0].remoteIP != "10.0.0.2" || out[0].peerIP != "10.37.0.10" || out[0].dir != dirOut {
+		t.Fatalf("unexpected outbound private flow event: %#v", out[0])
+	}
+
+	in := manager.gatewayIPPairToEvents(net.ParseIP("10.37.0.10"), net.ParseIP("10.0.0.2"), flowMeta{Proto: "tcp", SrcPort: "443", DstPort: "50000"}, 200)
+	if len(in) != 1 {
+		t.Fatalf("expected inbound private flow event, got %#v", in)
+	}
+	if in[0].remoteIP != "10.0.0.2" || in[0].peerIP != "10.37.0.10" || in[0].dir != dirIn {
+		t.Fatalf("unexpected inbound private flow event: %#v", in[0])
+	}
+	if in[0].flowID != out[0].flowID {
+		t.Fatalf("expected reverse packet to keep flow id %q, got %q", out[0].flowID, in[0].flowID)
+	}
+}
+
+func TestClientCandidateIPRanges(t *testing.T) {
+	for _, ip := range []string{"10.0.0.2", "172.16.1.2", "192.168.1.2", "100.64.1.2", "fc00::1"} {
+		if !isClientCandidateIP(net.ParseIP(ip)) {
+			t.Fatalf("expected %s to be a client candidate", ip)
+		}
+	}
+	for _, ip := range []string{"8.8.8.8", "127.0.0.1", "224.0.0.1"} {
+		if isClientCandidateIP(net.ParseIP(ip)) {
+			t.Fatalf("expected %s to be skipped as a client candidate", ip)
+		}
 	}
 }
 
@@ -137,13 +182,13 @@ func TestCaptureManagerCoalescesPacketEvents(t *testing.T) {
 	})
 
 	deltas := manager.drainDeltas()
-	if got := deltas["10.0.0.2"]; got.InBytes != 140 || got.OutBytes != 20 {
+	if got := deltas.IPs["10.0.0.2"]; got.InBytes != 140 || got.OutBytes != 20 {
 		t.Fatalf("unexpected 10.0.0.2 counters: %#v", got)
 	}
-	if got := deltas["8.8.8.8"]; got.InBytes != 0 || got.OutBytes != 10 {
+	if got := deltas.IPs["8.8.8.8"]; got.InBytes != 0 || got.OutBytes != 10 {
 		t.Fatalf("unexpected 8.8.8.8 counters: %#v", got)
 	}
-	if deltas := manager.drainDeltas(); len(deltas) != 0 {
+	if deltas := manager.drainDeltas(); len(deltas.IPs) != 0 || len(deltas.Flows) != 0 {
 		t.Fatalf("expected second drain to be empty, got %#v", deltas)
 	}
 }

@@ -19,9 +19,8 @@ need tar
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$os" in
 linux) os="linux" ;;
-darwin) os="darwin" ;;
 *)
-	echo "unsupported OS: $os" >&2
+	echo "unsupported OS: $os; net-peek uses Linux eBPF" >&2
 	exit 1
 	;;
 esac
