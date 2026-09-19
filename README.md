@@ -53,11 +53,21 @@ On a remote server:
 go install github.com/itcaat/net-peek@latest
 ```
 
-This installs the `net-peek` binary into `GOBIN`, or into `$(go env GOPATH)/bin` when `GOBIN` is not set. Make sure that directory is in `PATH`:
+This installs the `net-peek` binary into `GOBIN`, or into `$(go env GOPATH)/bin` when `GOBIN` is not set. Add that directory to your shell profile once so it remains in `PATH` after reconnecting:
 
 ```sh
-export PATH="$(go env GOPATH)/bin:$PATH"
+go_bin="$(go env GOPATH)/bin"
+case "${SHELL##*/}" in
+  bash) shell_profile="$HOME/.bashrc" ;;
+  zsh)  shell_profile="$HOME/.zshrc" ;;
+  *)    shell_profile="$HOME/.profile" ;;
+esac
+path_line="export PATH=\"$go_bin:\$PATH\""
+grep -qxF "$path_line" "$shell_profile" || printf '\n%s\n' "$path_line" >> "$shell_profile"
+export PATH="$go_bin:$PATH"
 ```
+
+The last command also makes `net-peek` available immediately in the current shell; new shells load the saved setting automatically.
 
 Then run:
 
