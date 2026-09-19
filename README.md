@@ -11,9 +11,7 @@ It shows:
 
 ## Requirements
 
-- Go 1.22+
-- `libpcap` development headers
-- packet-capture privileges
+Prebuilt release binaries only need packet-capture privileges. Building from source additionally requires Go 1.22+ and `libpcap` development headers.
 
 On Linux you can usually run it with `sudo`, or grant capture capabilities to the built binary:
 

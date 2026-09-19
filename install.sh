@@ -88,6 +88,11 @@ fi
 
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
 
+if ! "$tmp_dir/net-peek" --version; then
+	echo "downloaded net-peek binary is not compatible with this system; installation aborted" >&2
+	exit 1
+fi
+
 if [ ! -d "$BIN_DIR" ]; then
 	mkdir -p "$BIN_DIR"
 fi
@@ -100,4 +105,3 @@ else
 fi
 
 echo "Installed: $BIN_DIR/net-peek"
-"$BIN_DIR/net-peek" --version

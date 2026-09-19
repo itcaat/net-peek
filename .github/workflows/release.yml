@@ -55,11 +55,30 @@ jobs:
           commit="$(git rev-parse --short HEAD)"
           date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mkdir -p dist/package
-          go build \
-            -trimpath \
-            -ldflags "-s -w -X main.version=${version} -X main.commit=${commit} -X main.date=${date}" \
-            -o dist/package/net-peek \
-            .
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            docker run --rm \
+              -v "$PWD:/src" \
+              -w /src \
+              -e VERSION="$version" \
+              -e COMMIT="$commit" \
+              -e BUILD_DATE="$date" \
+              golang:1.22.12-alpine3.21 \
+              sh -euc '
+                apk add --no-cache build-base libpcap-dev
+                CGO_ENABLED=1 go build \
+                  -trimpath \
+                  -ldflags "-s -w -linkmode external -extldflags=-static -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
+                  -o dist/package/net-peek \
+                  .
+              '
+            file dist/package/net-peek | grep -q "statically linked"
+          else
+            go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${version} -X main.commit=${commit} -X main.date=${date}" \
+              -o dist/package/net-peek \
+              .
+          fi
           cp README.md dist/package/
           if compgen -G "LICENSE*" > /dev/null; then cp LICENSE* dist/package/; fi
           tar -czf "dist/net-peek_${GITHUB_REF_NAME}_${{ matrix.asset }}.tar.gz" -C dist/package .
